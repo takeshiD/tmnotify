@@ -1,0 +1,3 @@
+# Broadcast notifications to visible windows
+
+A live Notification is projected once into every distinct tmux window currently viewed by an attached client, rather than being sent to only one client or its Source Pane. These Window Displays share one lifecycle, timeout, and history record; the daemon reconciles them as clients move, pauses a Toast timeout when no window display is visible, and resolves an Attention action globally. Because tmux discards the originating client identity before pane input reaches the renderer, a jump uses the most recently active client viewing that window as a best-effort attribution; clients sharing a session may move together because the current window is session state in tmux.

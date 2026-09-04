@@ -1,0 +1,3 @@
+# Manage provider hooks conservatively
+
+tmnotify owns only structurally identified handlers that invoke the installing binary by absolute path, preserves one mode-0600 rolling backup before each real configuration change, and synchronizes only scopes where tmnotify is already installed. It never grants provider trust, reads undocumented trust stores, or claims to determine trust status; users are directed to each provider's `/hooks` interface. It also never rewrites Codex inline TOML hooks and refuses mixed Codex hook representations unless the user explicitly passes `--allow-mixed`; these constraints trade some convenience for predictable, reversible changes to security-sensitive user configuration.
