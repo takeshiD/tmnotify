@@ -5,6 +5,7 @@ pub mod config;
 pub mod daemon;
 pub mod doctor;
 pub mod history;
+pub mod hooks;
 pub mod notification;
 pub mod platform;
 pub mod protocol;

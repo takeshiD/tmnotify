@@ -176,7 +176,7 @@ pub struct HookArgs {
 pub enum HookAction {
     Install(HookMutationArgs),
     Remove(HookMutationArgs),
-    Sync(HookSelectionArgs),
+    Sync(HookSyncArgs),
     Status(HookSelectionArgs),
 }
 
@@ -194,6 +194,15 @@ pub struct HookMutationArgs {
 pub struct HookSelectionArgs {
     #[arg(value_enum)]
     pub provider: Option<ProviderArg>,
+}
+
+#[derive(Debug, Args, PartialEq)]
+pub struct HookSyncArgs {
+    #[arg(value_enum)]
+    pub provider: Option<ProviderArg>,
+    /// Keep Codex inline TOML hooks unchanged while syncing hooks.json.
+    #[arg(long)]
+    pub allow_mixed: bool,
 }
 
 #[derive(Debug, Args, PartialEq)]
@@ -437,5 +446,19 @@ mod tests {
     #[test]
     fn plain_and_json_history_modes_conflict() {
         assert!(parse_from(["tmnotify", "history", "--plain", "--json"]).is_err());
+    }
+
+    #[test]
+    fn hook_sync_accepts_the_explicit_mixed_codex_override() {
+        let cli = parse_from(["tmnotify", "hook", "sync", "codex", "--allow-mixed"]).unwrap();
+        assert_eq!(
+            cli.command,
+            Command::Hook(HookArgs {
+                action: HookAction::Sync(HookSyncArgs {
+                    provider: Some(ProviderArg::Codex),
+                    allow_mixed: true,
+                }),
+            })
+        );
     }
 }
