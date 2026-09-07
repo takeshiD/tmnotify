@@ -567,6 +567,54 @@ pub struct ResponseEnvelope<T> {
     pub result: T,
 }
 
+#[derive(Clone, Debug, PartialEq)]
+pub enum ClientResponse {
+    Success(Value),
+    Error(String),
+}
+
+pub fn decode_client_response(
+    frame: &[u8],
+    expected_request_id: Uuid,
+) -> Result<ClientResponse, ProtocolError> {
+    if frame.len() > MAX_REQUEST_BYTES {
+        return Err(ProtocolError::ResponseTooLarge {
+            limit: MAX_REQUEST_BYTES,
+        });
+    }
+    let value: Value = serde_json::from_slice(frame).map_err(ProtocolError::MalformedJson)?;
+    let object = value
+        .as_object()
+        .ok_or(ProtocolError::ResponseMustBeObject)?;
+    let version = object
+        .get("version")
+        .and_then(Value::as_u64)
+        .ok_or(ProtocolError::MissingOrInvalidField("version"))?;
+    if version != u64::from(PROTOCOL_VERSION) {
+        return Err(ProtocolError::UnsupportedVersion(version));
+    }
+    let request_id = object
+        .get("request_id")
+        .and_then(Value::as_str)
+        .ok_or(ProtocolError::MissingOrInvalidField("request_id"))?
+        .parse::<Uuid>()
+        .map_err(|_| ProtocolError::MissingOrInvalidField("request_id"))?;
+    if request_id != expected_request_id {
+        return Err(ProtocolError::ResponseRequestMismatch {
+            expected: expected_request_id,
+            actual: request_id,
+        });
+    }
+    match (object.get("result"), object.get("error")) {
+        (Some(result), None) => Ok(ClientResponse::Success(result.clone())),
+        (None, Some(error)) => error
+            .as_str()
+            .map(|error| ClientResponse::Error(error.to_owned()))
+            .ok_or(ProtocolError::MissingOrInvalidField("error")),
+        _ => Err(ProtocolError::InvalidResponseShape),
+    }
+}
+
 impl<T> ResponseEnvelope<T> {
     pub fn new(request_id: Uuid, result: T) -> Self {
         Self {
@@ -848,10 +896,14 @@ impl RendererMessage {
 pub enum ProtocolError {
     #[error("request exceeds the {limit}-byte limit")]
     FrameTooLarge { limit: usize },
+    #[error("response exceeds the {limit}-byte limit")]
+    ResponseTooLarge { limit: usize },
     #[error("malformed JSON: {0}")]
     MalformedJson(serde_json::Error),
     #[error("request must be a JSON object")]
     RequestMustBeObject,
+    #[error("response must be a JSON object")]
+    ResponseMustBeObject,
     #[error("missing or invalid field: {0}")]
     MissingOrInvalidField(&'static str),
     #[error("unsupported protocol version: {0}")]
@@ -864,6 +916,10 @@ pub enum ProtocolError {
     Encode(serde_json::Error),
     #[error("validated envelope and typed request do not match")]
     EnvelopeMismatch,
+    #[error("response request ID mismatch: expected {expected}, received {actual}")]
+    ResponseRequestMismatch { expected: Uuid, actual: Uuid },
+    #[error("response must contain exactly one of result or error")]
+    InvalidResponseShape,
     #[error("selector must contain exactly one of id or key")]
     InvalidSelector,
     #[error("update contains no fields")]
@@ -1254,6 +1310,48 @@ mod tests {
         assert!(matches!(
             ClientRequest::from_envelope(&envelope),
             Err(ProtocolError::InvalidHistoryLimit)
+        ));
+    }
+
+    #[test]
+    fn client_response_requires_matching_version_id_and_exclusive_shape() {
+        let id = Uuid::now_v7();
+        let success = serde_json::to_vec(&serde_json::json!({
+            "version": PROTOCOL_VERSION,
+            "request_id": id,
+            "result": { "accepted": true }
+        }))
+        .unwrap();
+        assert_eq!(
+            decode_client_response(&success, id).unwrap(),
+            ClientResponse::Success(serde_json::json!({ "accepted": true }))
+        );
+        let failure = serde_json::to_vec(&serde_json::json!({
+            "version": PROTOCOL_VERSION,
+            "request_id": id,
+            "accepted": false,
+            "error": "missing Source Pane"
+        }))
+        .unwrap();
+        assert_eq!(
+            decode_client_response(&failure, id).unwrap(),
+            ClientResponse::Error("missing Source Pane".into())
+        );
+
+        assert!(matches!(
+            decode_client_response(&success, Uuid::now_v7()),
+            Err(ProtocolError::ResponseRequestMismatch { .. })
+        ));
+        let ambiguous = serde_json::to_vec(&serde_json::json!({
+            "version": PROTOCOL_VERSION,
+            "request_id": id,
+            "result": {},
+            "error": "bad"
+        }))
+        .unwrap();
+        assert!(matches!(
+            decode_client_response(&ambiguous, id),
+            Err(ProtocolError::InvalidResponseShape)
         ));
     }
 }
