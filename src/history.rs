@@ -90,6 +90,14 @@ impl<T> HistoryTask<T> {
             .await
             .map_err(|_| HistoryError::WorkerStopped)?
     }
+
+    /// Waits from a dedicated blocking boundary such as the History UI action
+    /// worker. This must not be called by the daemon scheduler or a renderer.
+    pub(crate) fn blocking_wait(self) -> Result<T, HistoryError> {
+        self.receiver
+            .blocking_recv()
+            .map_err(|_| HistoryError::WorkerStopped)?
+    }
 }
 
 #[derive(Debug, Error)]

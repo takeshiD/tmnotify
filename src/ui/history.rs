@@ -1,18 +1,31 @@
-use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use std::io;
+use std::sync::{
+    Arc,
+    mpsc::{self, Receiver, SyncSender, TryRecvError, TrySendError},
+};
+use std::thread;
+use std::time::Duration;
+
+use chrono::Utc;
+use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use ratatui::{
-    Frame,
+    Frame, Terminal,
+    backend::Backend,
     layout::{Alignment, Constraint, Flex, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Borders, Clear, Paragraph, Wrap},
 };
 
-use crate::history::HistoryEntry;
+use super::TerminalSession;
+use crate::history::{History, HistoryEntry, HistoryQuery};
 use crate::notification::{Level, NotificationId, SourceContext, TmuxServerId};
 
 pub const MIN_WIDTH: u16 = 48;
 pub const MIN_HEIGHT: u16 = 10;
 pub const WIDE_WIDTH: u16 = 100;
+const ACTION_QUEUE_CAPACITY: usize = 8;
+const EVENT_POLL_INTERVAL: Duration = Duration::from_millis(50);
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum LoadState {
@@ -36,7 +49,7 @@ pub enum HistoryAction {
 #[derive(Clone, Debug)]
 pub struct HistoryView {
     entries: Vec<HistoryEntry>,
-    current_server: TmuxServerId,
+    current_server: Option<TmuxServerId>,
     selected: usize,
     detail_visible: bool,
     filter: String,
@@ -53,6 +66,10 @@ pub struct HistoryView {
 impl HistoryView {
     #[must_use]
     pub fn new(entries: Vec<HistoryEntry>, current_server: TmuxServerId) -> Self {
+        Self::for_scope(entries, Some(current_server))
+    }
+
+    fn for_scope(entries: Vec<HistoryEntry>, current_server: Option<TmuxServerId>) -> Self {
         Self {
             entries,
             current_server,
@@ -72,7 +89,13 @@ impl HistoryView {
 
     #[must_use]
     pub fn loading(current_server: TmuxServerId) -> Self {
-        let mut view = Self::new(Vec::new(), current_server);
+        let mut view = Self::for_scope(Vec::new(), Some(current_server));
+        view.load_state = LoadState::Loading;
+        view
+    }
+
+    fn loading_for_scope(current_server: Option<TmuxServerId>) -> Self {
+        let mut view = Self::for_scope(Vec::new(), current_server);
         view.load_state = LoadState::Loading;
         view
     }
@@ -88,6 +111,15 @@ impl HistoryView {
 
     pub fn set_error(&mut self, message: impl Into<String>) {
         self.status = Some(message.into());
+    }
+
+    fn replace_entries(&mut self, entries: Vec<HistoryEntry>) {
+        self.entries = entries;
+        self.selected = self
+            .selected
+            .min(self.filtered_indices().len().saturating_sub(1));
+        self.load_state = LoadState::Ready;
+        self.status = None;
     }
 
     pub fn handle_key(&mut self, key: KeyEvent) -> Option<HistoryAction> {
@@ -188,7 +220,7 @@ impl HistoryView {
             self.status = Some("Notification has no Source Pane".to_owned());
             return None;
         }
-        if entry.tmux_server_id != self.current_server {
+        if self.current_server.as_ref() != Some(&entry.tmux_server_id) {
             self.confirmation = Some(id);
             return None;
         }
@@ -231,6 +263,38 @@ impl HistoryView {
         Some(HistoryAction::Unhide(id))
     }
 
+    fn rollback_hide(&mut self, id: NotificationId) {
+        let Some(position) = self
+            .hidden_this_session
+            .iter()
+            .position(|entry| entry.id == id)
+        else {
+            return;
+        };
+        let entry = self.hidden_this_session.remove(position);
+        self.entries.push(entry);
+        self.sort_entries();
+    }
+
+    fn rollback_unhide(&mut self, id: NotificationId) {
+        let Some(position) = self.entries.iter().position(|entry| entry.id == id) else {
+            return;
+        };
+        self.hidden_this_session.push(self.entries.remove(position));
+        self.selected = self
+            .selected
+            .min(self.filtered_indices().len().saturating_sub(1));
+    }
+
+    fn sort_entries(&mut self) {
+        self.entries.sort_by(|left, right| {
+            right
+                .updated_at
+                .cmp(&left.updated_at)
+                .then(right.id.to_string().cmp(&left.id.to_string()))
+        });
+    }
+
     fn filtered_indices(&self) -> Vec<usize> {
         if self.filter.is_empty() {
             return (0..self.entries.len()).collect();
@@ -254,6 +318,344 @@ impl HistoryView {
                 haystack.contains(&needle).then_some(index)
             })
             .collect()
+    }
+}
+
+/// Describes how the caller established the tmux scope. An outside-terminal
+/// caller cannot construct a valid launch without an explicit server or the
+/// deliberate all-server mode.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum HistoryLaunch {
+    InsideTmux { current_server: TmuxServerId },
+    OutsideTmux(OutsideTmuxScope),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum OutsideTmuxScope {
+    ExplicitServer(TmuxServerId),
+    AllServers,
+}
+
+impl HistoryLaunch {
+    fn current_server(&self) -> Option<TmuxServerId> {
+        match self {
+            Self::InsideTmux { current_server }
+            | Self::OutsideTmux(OutsideTmuxScope::ExplicitServer(current_server)) => {
+                Some(current_server.clone())
+            }
+            Self::OutsideTmux(OutsideTmuxScope::AllServers) => None,
+        }
+    }
+
+    fn all_servers(&self) -> bool {
+        matches!(self, Self::OutsideTmux(OutsideTmuxScope::AllServers))
+    }
+}
+
+/// Blocking operations used by the UI action worker. Implementations may use
+/// SQLite and tmux because this trait is never invoked by the draw/event loop.
+pub trait HistoryActionBackend: Send + 'static {
+    fn ensure_open_allowed(&mut self) -> Result<(), String>;
+    fn list(&mut self, query: HistoryQuery) -> Result<Vec<HistoryEntry>, String>;
+    fn hide(&mut self, id: NotificationId) -> Result<(), String>;
+    fn unhide(&mut self, id: NotificationId) -> Result<(), String>;
+    /// Returns a nonfatal persistence warning after a successful pane switch.
+    fn jump(
+        &mut self,
+        id: NotificationId,
+        source: &SourceContext,
+    ) -> Result<Option<String>, String>;
+}
+
+/// Concrete History adapter. Callbacks retain tmux ownership at the caller
+/// seam: the guard checks for an active Attention Gate in the target window,
+/// while jump resolves and switches by stable pane ID (including other
+/// servers) without exposing command syntax here.
+pub struct HistoryActions<G, A, J> {
+    history: Arc<History>,
+    open_guard: G,
+    jump_guard: A,
+    jump: J,
+}
+
+impl<G, A, J> HistoryActions<G, A, J> {
+    pub fn new(history: Arc<History>, open_guard: G, jump_guard: A, jump: J) -> Self {
+        Self {
+            history,
+            open_guard,
+            jump_guard,
+            jump,
+        }
+    }
+}
+
+impl<G, A, J> HistoryActionBackend for HistoryActions<G, A, J>
+where
+    G: FnMut() -> Result<(), String> + Send + 'static,
+    A: FnMut(&SourceContext) -> Result<(), String> + Send + 'static,
+    J: FnMut(&SourceContext) -> Result<(), String> + Send + 'static,
+{
+    fn ensure_open_allowed(&mut self) -> Result<(), String> {
+        (self.open_guard)()
+    }
+
+    fn list(&mut self, query: HistoryQuery) -> Result<Vec<HistoryEntry>, String> {
+        self.history
+            .list(query)
+            .map_err(|error| error.to_string())?
+            .blocking_wait()
+            .map_err(|error| error.to_string())
+    }
+
+    fn hide(&mut self, id: NotificationId) -> Result<(), String> {
+        self.history
+            .hide(id, Utc::now())
+            .map_err(|error| error.to_string())?
+            .blocking_wait()
+            .map(|_| ())
+            .map_err(|error| error.to_string())
+    }
+
+    fn unhide(&mut self, id: NotificationId) -> Result<(), String> {
+        self.history
+            .unhide(id)
+            .map_err(|error| error.to_string())?
+            .blocking_wait()
+            .map(|_| ())
+            .map_err(|error| error.to_string())
+    }
+
+    fn jump(
+        &mut self,
+        id: NotificationId,
+        source: &SourceContext,
+    ) -> Result<Option<String>, String> {
+        (self.jump_guard)(source)?;
+        (self.jump)(source)?;
+        match self.history.mark_jumped(id, Utc::now()) {
+            Ok(task) => match task.blocking_wait() {
+                Ok(_) => Ok(None),
+                Err(error) => Ok(Some(format!("History jump was not recorded: {error}"))),
+            },
+            Err(error) => Ok(Some(format!("History jump was not recorded: {error}"))),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum HistoryOutcome {
+    Closed,
+    Jumped { warning: Option<String> },
+    Interrupted,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum HistoryUiError {
+    #[error("terminal IO failed: {0}")]
+    Io(#[from] io::Error),
+    #[error("terminal draw failed: {0}")]
+    Draw(String),
+    #[error("History action worker disconnected")]
+    WorkerDisconnected,
+    #[error("History cannot open: {0}")]
+    OpenRefused(String),
+}
+
+/// Event source seam keeps the loop PTY-testable while production uses
+/// Crossterm's resize, key, focus, mouse, and paste events.
+pub trait HistoryEventSource {
+    fn poll(&mut self, timeout: Duration) -> io::Result<bool>;
+    fn read(&mut self) -> io::Result<Event>;
+}
+
+pub struct CrosstermEvents;
+
+impl HistoryEventSource for CrosstermEvents {
+    fn poll(&mut self, timeout: Duration) -> io::Result<bool> {
+        event::poll(timeout)
+    }
+
+    fn read(&mut self) -> io::Result<Event> {
+        event::read()
+    }
+}
+
+enum WorkerCommand {
+    Load(HistoryQuery),
+    Hide(NotificationId),
+    Unhide(NotificationId),
+    Jump(NotificationId, SourceContext),
+}
+
+enum WorkerReply {
+    OpenRefused(String),
+    Loaded(Result<Vec<HistoryEntry>, String>),
+    Mutated {
+        mutation: Mutation,
+        result: Result<&'static str, String>,
+    },
+    Jumped(Result<Option<String>, String>),
+}
+
+#[derive(Clone, Copy)]
+enum Mutation {
+    Hide(NotificationId),
+    Unhide(NotificationId),
+}
+
+struct ActionBridge {
+    commands: SyncSender<WorkerCommand>,
+    replies: Receiver<WorkerReply>,
+}
+
+impl ActionBridge {
+    fn spawn(mut backend: impl HistoryActionBackend) -> io::Result<Self> {
+        let (commands, command_rx) = mpsc::sync_channel(ACTION_QUEUE_CAPACITY);
+        let (reply_tx, replies) = mpsc::sync_channel(ACTION_QUEUE_CAPACITY);
+        thread::Builder::new()
+            .name("tmnotify-history-ui-actions".to_owned())
+            .spawn(move || {
+                while let Ok(command) = command_rx.recv() {
+                    let reply = match command {
+                        WorkerCommand::Load(query) => match backend.ensure_open_allowed() {
+                            Ok(()) => WorkerReply::Loaded(backend.list(query)),
+                            Err(error) => WorkerReply::OpenRefused(error),
+                        },
+                        WorkerCommand::Hide(id) => WorkerReply::Mutated {
+                            mutation: Mutation::Hide(id),
+                            result: backend.hide(id).map(|()| "Hidden · u to undo"),
+                        },
+                        WorkerCommand::Unhide(id) => WorkerReply::Mutated {
+                            mutation: Mutation::Unhide(id),
+                            result: backend.unhide(id).map(|()| "Hide undone"),
+                        },
+                        WorkerCommand::Jump(id, source) => {
+                            WorkerReply::Jumped(backend.jump(id, &source))
+                        }
+                    };
+                    if reply_tx.send(reply).is_err() {
+                        break;
+                    }
+                }
+            })?;
+        Ok(Self { commands, replies })
+    }
+
+    fn submit(&self, command: WorkerCommand) -> Result<(), String> {
+        self.commands
+            .try_send(command)
+            .map_err(|error| match error {
+                TrySendError::Full(_) => "History action queue is full".to_owned(),
+                TrySendError::Disconnected(_) => "History action worker disconnected".to_owned(),
+            })
+    }
+}
+
+pub fn run(
+    launch: HistoryLaunch,
+    backend: impl HistoryActionBackend,
+) -> Result<HistoryOutcome, HistoryUiError> {
+    let mut terminal = TerminalSession::enter()?;
+    let mut events = CrosstermEvents;
+    run_with_terminal(terminal.terminal_mut(), &mut events, launch, backend)
+}
+
+pub fn run_with_terminal<B: Backend, E: HistoryEventSource>(
+    terminal: &mut Terminal<B>,
+    events: &mut E,
+    launch: HistoryLaunch,
+    backend: impl HistoryActionBackend,
+) -> Result<HistoryOutcome, HistoryUiError>
+where
+    B::Error: std::fmt::Display,
+{
+    let current_server = launch.current_server();
+    let mut view = HistoryView::loading_for_scope(current_server);
+    let bridge = ActionBridge::spawn(backend)?;
+    bridge
+        .submit(WorkerCommand::Load(HistoryQuery {
+            all_servers: launch.all_servers(),
+            ..HistoryQuery::default()
+        }))
+        .map_err(|_| HistoryUiError::WorkerDisconnected)?;
+
+    loop {
+        if let Some(outcome) = apply_worker_replies(&mut view, &bridge)? {
+            return Ok(outcome);
+        }
+        terminal
+            .draw(|frame| render(frame, &view))
+            .map_err(|error| HistoryUiError::Draw(error.to_string()))?;
+        if !events.poll(EVENT_POLL_INTERVAL)? {
+            continue;
+        }
+        match events.read()? {
+            Event::Key(key)
+                if key.kind == KeyEventKind::Press
+                    && key.code == KeyCode::Char('c')
+                    && key.modifiers.contains(KeyModifiers::CONTROL) =>
+            {
+                return Ok(HistoryOutcome::Interrupted);
+            }
+            Event::Key(key) => {
+                if let Some(action) = view.handle_key(key) {
+                    match action {
+                        HistoryAction::Quit => return Ok(HistoryOutcome::Closed),
+                        HistoryAction::Hide(id) => {
+                            submit_or_report(&bridge, WorkerCommand::Hide(id), &mut view)
+                        }
+                        HistoryAction::Unhide(id) => {
+                            submit_or_report(&bridge, WorkerCommand::Unhide(id), &mut view)
+                        }
+                        HistoryAction::Jump { id, source } => {
+                            submit_or_report(&bridge, WorkerCommand::Jump(id, source), &mut view)
+                        }
+                    }
+                }
+            }
+            Event::Resize(_, _) => {}
+            Event::Mouse(_) | Event::FocusGained | Event::FocusLost | Event::Paste(_) => {}
+        }
+    }
+}
+
+fn submit_or_report(bridge: &ActionBridge, command: WorkerCommand, view: &mut HistoryView) {
+    if let Err(error) = bridge.submit(command) {
+        view.set_error(error);
+    }
+}
+
+fn apply_worker_replies(
+    view: &mut HistoryView,
+    bridge: &ActionBridge,
+) -> Result<Option<HistoryOutcome>, HistoryUiError> {
+    loop {
+        match bridge.replies.try_recv() {
+            Ok(WorkerReply::OpenRefused(error)) => {
+                return Err(HistoryUiError::OpenRefused(error));
+            }
+            Ok(WorkerReply::Loaded(Ok(entries))) => view.replace_entries(entries),
+            Ok(WorkerReply::Loaded(Err(error))) => view.set_load_state(LoadState::Error(error)),
+            Ok(WorkerReply::Mutated {
+                result: Ok(status), ..
+            }) => view.status = Some(status.to_owned()),
+            Ok(WorkerReply::Mutated {
+                mutation,
+                result: Err(error),
+            }) => {
+                match mutation {
+                    Mutation::Hide(id) => view.rollback_hide(id),
+                    Mutation::Unhide(id) => view.rollback_unhide(id),
+                }
+                view.set_error(error);
+            }
+            Ok(WorkerReply::Jumped(Err(error))) => view.set_error(error),
+            Ok(WorkerReply::Jumped(Ok(warning))) => {
+                return Ok(Some(HistoryOutcome::Jumped { warning }));
+            }
+            Err(TryRecvError::Empty) => return Ok(None),
+            Err(TryRecvError::Disconnected) => return Err(HistoryUiError::WorkerDisconnected),
+        }
     }
 }
 
@@ -475,12 +877,17 @@ fn level_style(level: Level, color: bool) -> Style {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::VecDeque;
+    use std::sync::{Arc, Mutex};
+    use std::thread;
     use std::time::Duration;
 
     use chrono::{DateTime, Utc};
     use ratatui::{Terminal, backend::TestBackend};
+    use tempfile::tempdir;
 
     use super::*;
+    use crate::config::HistoryConfig;
     use crate::notification::{DeliveryState, NormalizedMetadata, Presentation, Priority, Timeout};
 
     fn server(name: &str) -> TmuxServerId {
@@ -618,5 +1025,268 @@ mod tests {
         let rendered = draw(80, 24, &view);
         assert!(rendered.contains("* History"));
         assert!(rendered.contains("smart-case filter"));
+    }
+
+    #[derive(Clone)]
+    struct FakeActions {
+        entries: Vec<HistoryEntry>,
+        calls: Arc<Mutex<Vec<String>>>,
+        open_error: Option<String>,
+        jump_error: Option<String>,
+    }
+
+    impl HistoryActionBackend for FakeActions {
+        fn ensure_open_allowed(&mut self) -> Result<(), String> {
+            self.calls.lock().unwrap().push("open".into());
+            self.open_error.clone().map_or(Ok(()), Err)
+        }
+
+        fn list(&mut self, query: HistoryQuery) -> Result<Vec<HistoryEntry>, String> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push(format!("list:{}", query.all_servers));
+            Ok(self.entries.clone())
+        }
+
+        fn hide(&mut self, id: NotificationId) -> Result<(), String> {
+            self.calls.lock().unwrap().push(format!("hide:{id}"));
+            Ok(())
+        }
+
+        fn unhide(&mut self, id: NotificationId) -> Result<(), String> {
+            self.calls.lock().unwrap().push(format!("unhide:{id}"));
+            Ok(())
+        }
+
+        fn jump(
+            &mut self,
+            id: NotificationId,
+            source: &SourceContext,
+        ) -> Result<Option<String>, String> {
+            self.calls.lock().unwrap().push(format!(
+                "jump:{id}:{}:{}",
+                source.tmux_server_id().as_str(),
+                source.pane_id()
+            ));
+            self.jump_error.clone().map_or(Ok(None), Err)
+        }
+    }
+
+    struct ScriptedEvents {
+        events: VecDeque<Event>,
+    }
+
+    impl ScriptedEvents {
+        fn keys(keys: impl IntoIterator<Item = KeyEvent>) -> Self {
+            Self {
+                events: keys.into_iter().map(Event::Key).collect(),
+            }
+        }
+    }
+
+    impl HistoryEventSource for ScriptedEvents {
+        fn poll(&mut self, timeout: Duration) -> io::Result<bool> {
+            thread::sleep(timeout.min(Duration::from_millis(5)));
+            Ok(!self.events.is_empty())
+        }
+
+        fn read(&mut self) -> io::Result<Event> {
+            self.events
+                .pop_front()
+                .ok_or_else(|| io::Error::new(io::ErrorKind::UnexpectedEof, "no event"))
+        }
+    }
+
+    #[test]
+    fn action_bridge_serializes_fake_storage_and_jump_actions() {
+        let item = entry("alpha", "Build", "done", true);
+        let id = item.id;
+        let source = item.source.clone().unwrap();
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let bridge = ActionBridge::spawn(FakeActions {
+            entries: vec![item],
+            calls: Arc::clone(&calls),
+            open_error: None,
+            jump_error: None,
+        })
+        .unwrap();
+
+        bridge
+            .submit(WorkerCommand::Load(HistoryQuery::default()))
+            .unwrap();
+        assert!(matches!(
+            bridge.replies.recv_timeout(Duration::from_secs(1)),
+            Ok(WorkerReply::Loaded(Ok(entries))) if entries.len() == 1
+        ));
+        bridge.submit(WorkerCommand::Hide(id)).unwrap();
+        assert!(matches!(
+            bridge.replies.recv_timeout(Duration::from_secs(1)),
+            Ok(WorkerReply::Mutated { result: Ok(_), .. })
+        ));
+        bridge.submit(WorkerCommand::Unhide(id)).unwrap();
+        assert!(matches!(
+            bridge.replies.recv_timeout(Duration::from_secs(1)),
+            Ok(WorkerReply::Mutated { result: Ok(_), .. })
+        ));
+        bridge.submit(WorkerCommand::Jump(id, source)).unwrap();
+        assert!(matches!(
+            bridge.replies.recv_timeout(Duration::from_secs(1)),
+            Ok(WorkerReply::Jumped(Ok(None)))
+        ));
+
+        let calls = calls.lock().unwrap();
+        assert_eq!(calls[0], "open");
+        assert_eq!(calls[1], "list:false");
+        assert!(calls[2].starts_with("hide:"));
+        assert!(calls[3].starts_with("unhide:"));
+        assert!(calls[4].contains("jump:"));
+        assert!(calls[4].ends_with(":alpha:%3"));
+    }
+
+    #[test]
+    fn test_backend_loop_confirms_cross_server_jump_and_handles_resize() {
+        let remote = entry("beta", "remote", "done", true);
+        let id = remote.id;
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let actions = FakeActions {
+            entries: vec![remote],
+            calls: Arc::clone(&calls),
+            open_error: None,
+            jump_error: None,
+        };
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut events = ScriptedEvents {
+            events: [
+                Event::Resize(100, 30),
+                Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+                Event::Key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE)),
+            ]
+            .into(),
+        };
+
+        let outcome = run_with_terminal(
+            &mut terminal,
+            &mut events,
+            HistoryLaunch::InsideTmux {
+                current_server: server("alpha"),
+            },
+            actions,
+        )
+        .unwrap();
+        assert_eq!(outcome, HistoryOutcome::Jumped { warning: None });
+        assert!(
+            calls
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|call| call.starts_with(&format!("jump:{id}:beta:%3")))
+        );
+    }
+
+    #[test]
+    fn open_guard_refusal_is_reported_without_entering_history() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let actions = FakeActions {
+            entries: Vec::new(),
+            calls,
+            open_error: Some("Attention is active in this window".into()),
+            jump_error: None,
+        };
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut events = ScriptedEvents {
+            events: VecDeque::new(),
+        };
+
+        assert!(matches!(
+            run_with_terminal(
+                &mut terminal,
+                &mut events,
+                HistoryLaunch::OutsideTmux(OutsideTmuxScope::AllServers),
+                actions,
+            ),
+            Err(HistoryUiError::OpenRefused(message))
+                if message == "Attention is active in this window"
+        ));
+    }
+
+    #[test]
+    fn control_c_returns_interrupted() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let actions = FakeActions {
+            entries: Vec::new(),
+            calls,
+            open_error: None,
+            jump_error: None,
+        };
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut events =
+            ScriptedEvents::keys([KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)]);
+
+        assert_eq!(
+            run_with_terminal(
+                &mut terminal,
+                &mut events,
+                HistoryLaunch::InsideTmux {
+                    current_server: server("alpha"),
+                },
+                actions,
+            )
+            .unwrap(),
+            HistoryOutcome::Interrupted
+        );
+    }
+
+    #[test]
+    fn failed_hide_is_rolled_back_in_view_state() {
+        let item = entry("alpha", "Build", "done", true);
+        let id = item.id;
+        let mut view = HistoryView::new(vec![item], server("alpha"));
+        assert_eq!(
+            view.handle_key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE)),
+            Some(HistoryAction::Hide(id))
+        );
+        assert!(view.entries.is_empty());
+        view.rollback_hide(id);
+        assert_eq!(view.entries.len(), 1);
+        assert_eq!(view.entries[0].id, id);
+    }
+
+    #[test]
+    fn concrete_actions_refuse_jump_before_switch_when_attention_is_active() {
+        let directory = tempdir().unwrap();
+        let history = Arc::new(
+            History::open(
+                directory.path().join("disabled.sqlite3"),
+                server("alpha"),
+                &HistoryConfig {
+                    enabled: false,
+                    ..HistoryConfig::default()
+                },
+                Utc::now(),
+            )
+            .unwrap(),
+        );
+        let switches = Arc::new(Mutex::new(0));
+        let switch_counter = Arc::clone(&switches);
+        let mut actions = HistoryActions::new(
+            history,
+            || Ok(()),
+            |_source: &SourceContext| Err("Attention is active in the target window".into()),
+            move |_source: &SourceContext| {
+                *switch_counter.lock().unwrap() += 1;
+                Ok(())
+            },
+        );
+        let item = entry("alpha", "Build", "done", true);
+
+        assert_eq!(
+            actions.jump(item.id, item.source.as_ref().unwrap()),
+            Err("Attention is active in the target window".into())
+        );
+        assert_eq!(*switches.lock().unwrap(), 0);
     }
 }
