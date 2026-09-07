@@ -1,0 +1,39 @@
+name: tmux master compatibility
+
+on:
+  schedule:
+    - cron: "17 4 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: tmux-master-compatibility
+  cancel-in-progress: true
+
+jobs:
+  compatibility:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - name: Install tmux build dependencies
+        run: sudo apt-get update && sudo apt-get install -y automake bison build-essential libevent-dev libncurses-dev pkg-config
+      - name: Build current tmux master
+        run: |
+          git clone --depth=1 --branch master https://github.com/tmux/tmux.git "$RUNNER_TEMP/tmux"
+          git -C "$RUNNER_TEMP/tmux" rev-parse HEAD | tee "$RUNNER_TEMP/tmux-master-commit"
+          cd "$RUNNER_TEMP/tmux"
+          sh autogen.sh
+          ./configure --prefix="$RUNNER_TEMP/tmux-install"
+          make -j2 install
+      - name: Probe only an isolated tmux server
+        run: scripts/test-tmux-capabilities.sh "$RUNNER_TEMP/tmux-install/bin/tmux"
+      - name: Run deterministic tmux module tests
+        run: |
+          cargo test --locked tmux::capability
+          cargo test --locked tmux::control
+          cargo test --locked tmux::topology
+      - name: Report resolved upstream commit
+        if: always()
+        run: cat "$RUNNER_TEMP/tmux-master-commit"
