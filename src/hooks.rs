@@ -297,16 +297,11 @@ impl HookManager {
             Scope::Project => self.project.join(".codex/config.toml"),
             Scope::Local => return Ok(()),
         };
-        let contents = match fs::read_to_string(&config) {
-            Ok(contents) => contents,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
-            Err(source) => {
-                return Err(HookError::Io {
-                    path: config,
-                    source,
-                });
-            }
+        let Some(bytes) = read_bounded_file(&config)? else {
+            return Ok(());
         };
+        let contents =
+            String::from_utf8(bytes).map_err(|_| HookError::InvalidUtf8(config.clone()))?;
         let value: toml::Value = toml::from_str(&contents).map_err(|source| HookError::Toml {
             path: config.clone(),
             source,
@@ -374,34 +369,9 @@ impl Document {
 use serde::Serialize;
 
 fn read_document(path: &Path) -> Result<Option<Document>, HookError> {
-    match fs::symlink_metadata(path) {
-        Ok(metadata) if metadata.file_type().is_symlink() => {
-            return Err(HookError::SymbolicLink(path.to_owned()));
-        }
-        Ok(metadata) if !metadata.is_file() => {
-            return Err(HookError::InvalidPath(path.to_owned()));
-        }
-        Ok(_) => {}
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
-        Err(source) => {
-            return Err(HookError::Io {
-                path: path.to_owned(),
-                source,
-            });
-        }
-    }
-    let bytes = match fs::read(path) {
-        Ok(bytes) => bytes,
-        Err(source) => {
-            return Err(HookError::Io {
-                path: path.to_owned(),
-                source,
-            });
-        }
+    let Some(bytes) = read_bounded_file(path)? else {
+        return Ok(None);
     };
-    if bytes.len() as u64 > MAX_PROVIDER_CONFIG_BYTES {
-        return Err(HookError::TooLarge(path.to_owned()));
-    }
     let value: Value = serde_json::from_slice(&bytes).map_err(|source| HookError::Json {
         path: path.to_owned(),
         source,
@@ -423,6 +393,49 @@ fn read_document(path: &Path) -> Result<Option<Document>, HookError> {
         newline,
         final_newline,
     }))
+}
+
+fn read_bounded_file(path: &Path) -> Result<Option<Vec<u8>>, HookError> {
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    options.custom_flags(libc::O_NOFOLLOW);
+    let mut file = match options.open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        #[cfg(unix)]
+        Err(error) if error.raw_os_error() == Some(libc::ELOOP) => {
+            return Err(HookError::SymbolicLink(path.to_owned()));
+        }
+        Err(source) => {
+            return Err(HookError::Io {
+                path: path.to_owned(),
+                source,
+            });
+        }
+    };
+    let metadata = file.metadata().map_err(|source| HookError::Io {
+        path: path.to_owned(),
+        source,
+    })?;
+    if !metadata.is_file() {
+        return Err(HookError::InvalidPath(path.to_owned()));
+    }
+    if metadata.len() > MAX_PROVIDER_CONFIG_BYTES {
+        return Err(HookError::TooLarge(path.to_owned()));
+    }
+    let mut bytes = Vec::with_capacity(metadata.len() as usize);
+    Read::by_ref(&mut file)
+        .take(MAX_PROVIDER_CONFIG_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|source| HookError::Io {
+            path: path.to_owned(),
+            source,
+        })?;
+    if bytes.len() as u64 > MAX_PROVIDER_CONFIG_BYTES {
+        return Err(HookError::TooLarge(path.to_owned()));
+    }
+    Ok(Some(bytes))
 }
 
 fn detect_indent(bytes: &[u8]) -> Option<Vec<u8>> {
@@ -696,7 +709,9 @@ fn provider_event_names(provider: Provider, event: HookEvent) -> &'static [&'sta
         (Provider::Claude, HookEvent::Completed) => &["Stop"],
         (Provider::Claude, HookEvent::Failed) => &["StopFailure"],
         (Provider::Claude, HookEvent::Started) => &["SessionStart"],
-        (Provider::Claude, HookEvent::Interrupted) => &["SessionEnd"],
+        // SessionEnd includes clear/resume/logout/normal exits and cannot
+        // identify an interruption without inventing provider semantics.
+        (Provider::Claude, HookEvent::Interrupted) => &[],
         (Provider::Claude, HookEvent::SubagentCompleted) => &["SubagentStop"],
         (Provider::Claude, HookEvent::ToolStarted) => &["PreToolUse"],
         (Provider::Claude, HookEvent::ToolCompleted) => &["PostToolUse"],
@@ -866,6 +881,8 @@ pub enum HookError {
     InvalidHooksShape,
     #[error("invalid path: {0}")]
     InvalidPath(PathBuf),
+    #[error("provider configuration is not valid UTF-8: {0}")]
+    InvalidUtf8(PathBuf),
     #[error("provider configuration is a symbolic link: {0}")]
     SymbolicLink(PathBuf),
     #[error("invalid provider JSON at {path}: {source}")]
@@ -1100,6 +1117,37 @@ mod tests {
             fs::read_to_string(config).expect("unchanged TOML"),
             "[hooks]\nStop = [{ command = \"other\" }]\n"
         );
+    }
+
+    #[test]
+    fn codex_inline_toml_read_is_bounded_and_does_not_follow_symlinks() {
+        let temp = tempfile::tempdir().expect("temporary directory");
+        let manager = manager(temp.path(), &temp.path().join("bin/tmnotify"));
+        let config = temp.path().join("project/.codex/config.toml");
+        fs::create_dir_all(config.parent().expect("parent")).expect("directory");
+        fs::write(
+            &config,
+            vec![b'x'; usize::try_from(MAX_PROVIDER_CONFIG_BYTES).unwrap() + 1],
+        )
+        .expect("oversized TOML");
+        assert!(matches!(
+            manager.install(Provider::Codex, Scope::Project, &minimal(), false),
+            Err(HookError::TooLarge(path)) if path == config
+        ));
+        assert!(!temp.path().join("project/.codex/hooks.json").exists());
+
+        #[cfg(unix)]
+        {
+            fs::remove_file(&config).expect("remove oversized fixture");
+            let target = temp.path().join("inline.toml");
+            fs::write(&target, "[hooks]\n").expect("target");
+            std::os::unix::fs::symlink(&target, &config).expect("symlink");
+            assert!(matches!(
+                manager.install(Provider::Codex, Scope::Project, &minimal(), false),
+                Err(HookError::SymbolicLink(path)) if path == config
+            ));
+            assert_eq!(fs::read_to_string(target).unwrap(), "[hooks]\n");
+        }
     }
 
     #[test]
