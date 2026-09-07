@@ -8,4 +8,5 @@ pub mod notification;
 pub mod platform;
 pub mod protocol;
 pub mod providers;
+pub mod render;
 pub mod tmux;

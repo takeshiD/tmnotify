@@ -12,6 +12,8 @@ use serde_json::Value;
 use thiserror::Error;
 use uuid::Uuid;
 
+use crate::notification::{Level, Notification, Presentation, Provider};
+
 pub const PROTOCOL_VERSION: u16 = 1;
 pub const MAX_REQUEST_BYTES: usize = 64 * 1024;
 pub const REQUEST_CACHE_CAPACITY: usize = 10_000;
@@ -95,6 +97,63 @@ impl RequestEnvelope {
 
     pub fn payload_matches(&self, other: &Self) -> bool {
         self.request_id == other.request_id && self.value == other.value
+    }
+
+    /// Extracts the credential from a renderer's first private-socket frame.
+    /// Its custom Debug implementation prevents accidental token disclosure.
+    pub fn renderer_redemption(&self) -> Result<RendererRedemption, ProtocolError> {
+        if self.kind != RequestKind::RendererRedeem {
+            return Err(ProtocolError::UnexpectedRequestType);
+        }
+        let window_display_id = self
+            .value
+            .get("window_display")
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty() && value.len() <= 128)
+            .ok_or(ProtocolError::MissingOrInvalidField("window_display"))?;
+        let token = self
+            .value
+            .get("token")
+            .and_then(Value::as_str)
+            .filter(|value| {
+                value.len() == 64
+                    && value
+                        .bytes()
+                        .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+            })
+            .ok_or(ProtocolError::MissingOrInvalidField("token"))?;
+        Ok(RendererRedemption {
+            window_display_id: window_display_id.to_owned(),
+            token: token.to_owned(),
+        })
+    }
+}
+
+#[derive(Clone, Eq, PartialEq)]
+pub struct RendererRedemption {
+    window_display_id: String,
+    token: String,
+}
+
+impl RendererRedemption {
+    #[must_use]
+    pub fn window_display_id(&self) -> &str {
+        &self.window_display_id
+    }
+
+    #[must_use]
+    pub fn token(&self) -> &str {
+        &self.token
+    }
+}
+
+impl std::fmt::Debug for RendererRedemption {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("RendererRedemption")
+            .field("window_display_id", &self.window_display_id)
+            .field("token", &"[REDACTED]")
+            .finish()
     }
 }
 
@@ -202,6 +261,237 @@ pub struct Acknowledgement {
     pub disposition: Disposition,
 }
 
+/// The content sent only after a renderer has authenticated on the private
+/// daemon connection. This type deliberately contains no renderer credential.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RendererContent {
+    notification_id: Uuid,
+    presentation: Presentation,
+    level: Level,
+    title: String,
+    body: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    source: Option<RendererSource>,
+    metadata: RendererMetadata,
+}
+
+impl RendererContent {
+    #[must_use]
+    pub fn notification_id(&self) -> Uuid {
+        self.notification_id
+    }
+
+    #[must_use]
+    pub fn presentation(&self) -> Presentation {
+        self.presentation
+    }
+
+    #[must_use]
+    pub fn level(&self) -> Level {
+        self.level
+    }
+
+    #[must_use]
+    pub fn title(&self) -> &str {
+        &self.title
+    }
+
+    #[must_use]
+    pub fn body(&self) -> &str {
+        &self.body
+    }
+
+    #[must_use]
+    pub fn source(&self) -> Option<&RendererSource> {
+        self.source.as_ref()
+    }
+
+    #[must_use]
+    pub fn metadata(&self) -> &RendererMetadata {
+        &self.metadata
+    }
+}
+
+impl From<&Notification> for RendererContent {
+    fn from(notification: &Notification) -> Self {
+        let source = notification.source().map(|source| RendererSource {
+            provider: source.provider(),
+            provider_session_id: source.provider_session_id().map(str::to_owned),
+            session_id: source.session_id().to_owned(),
+            window_id: source.window_id().to_owned(),
+            pane_id: source.pane_id().to_owned(),
+            cwd: source.cwd().map(|path| path.to_string_lossy().into_owned()),
+            command: source.command().map(str::to_owned),
+            pane_title: source.pane_title().map(str::to_owned),
+        });
+        let metadata = notification.metadata();
+        Self {
+            notification_id: notification.id().as_uuid(),
+            presentation: notification.presentation(),
+            level: notification.level(),
+            title: notification.title().to_owned(),
+            body: notification.body().to_owned(),
+            source,
+            metadata: RendererMetadata {
+                agent_event_kind: metadata.agent_event_kind(),
+                agent_name: metadata.agent_name().map(str::to_owned),
+                tool_name: metadata.tool_name().map(str::to_owned),
+            },
+        }
+    }
+}
+
+/// Source fields useful to an Attention renderer. Complete process arguments
+/// and provider transcript paths have no representation on this wire.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RendererSource {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    provider: Option<Provider>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    provider_session_id: Option<String>,
+    session_id: String,
+    window_id: String,
+    pane_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cwd: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    command: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pane_title: Option<String>,
+}
+
+impl RendererSource {
+    #[must_use]
+    pub fn provider(&self) -> Option<Provider> {
+        self.provider
+    }
+
+    #[must_use]
+    pub fn provider_session_id(&self) -> Option<&str> {
+        self.provider_session_id.as_deref()
+    }
+
+    #[must_use]
+    pub fn session_id(&self) -> &str {
+        &self.session_id
+    }
+
+    #[must_use]
+    pub fn window_id(&self) -> &str {
+        &self.window_id
+    }
+
+    #[must_use]
+    pub fn pane_id(&self) -> &str {
+        &self.pane_id
+    }
+
+    #[must_use]
+    pub fn cwd(&self) -> Option<&str> {
+        self.cwd.as_deref()
+    }
+
+    #[must_use]
+    pub fn command(&self) -> Option<&str> {
+        self.command.as_deref()
+    }
+
+    #[must_use]
+    pub fn pane_title(&self) -> Option<&str> {
+        self.pane_title.as_deref()
+    }
+}
+
+/// Only normalized, explicitly allowlisted metadata crosses this boundary.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RendererMetadata {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    agent_event_kind: Option<crate::notification::AgentEventKind>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    agent_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tool_name: Option<String>,
+}
+
+impl RendererMetadata {
+    #[must_use]
+    pub fn agent_event_kind(&self) -> Option<crate::notification::AgentEventKind> {
+        self.agent_event_kind
+    }
+
+    #[must_use]
+    pub fn agent_name(&self) -> Option<&str> {
+        self.agent_name.as_deref()
+    }
+
+    #[must_use]
+    pub fn tool_name(&self) -> Option<&str> {
+        self.tool_name.as_deref()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum RendererTermination {
+    Recreated,
+    Dismissed,
+    Jumped,
+    TimedOut,
+    RenderFailed,
+    DaemonStopped,
+    ServerEnded,
+}
+
+/// Frames streamed after a successful one-time credential redemption.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "kebab-case")]
+pub enum RendererMessage {
+    Initial { content: RendererContent },
+    Update { content: RendererContent },
+    Terminate { reason: RendererTermination },
+}
+
+#[derive(Serialize, Deserialize)]
+struct RendererWireFrame {
+    version: u16,
+    #[serde(flatten)]
+    message: RendererMessage,
+}
+
+impl RendererMessage {
+    pub fn encode_line(&self) -> Result<Vec<u8>, ProtocolError> {
+        let mut encoded = serde_json::to_vec(&RendererWireFrame {
+            version: PROTOCOL_VERSION,
+            message: self.clone(),
+        })
+        .map_err(ProtocolError::MalformedJson)?;
+        if encoded.len() > MAX_REQUEST_BYTES {
+            return Err(ProtocolError::FrameTooLarge {
+                limit: MAX_REQUEST_BYTES,
+            });
+        }
+        encoded.push(b'\n');
+        Ok(encoded)
+    }
+
+    pub fn decode(frame: &[u8]) -> Result<Self, ProtocolError> {
+        let frame = frame.strip_suffix(b"\n").unwrap_or(frame);
+        if frame.len() > MAX_REQUEST_BYTES {
+            return Err(ProtocolError::FrameTooLarge {
+                limit: MAX_REQUEST_BYTES,
+            });
+        }
+        let decoded: RendererWireFrame =
+            serde_json::from_slice(frame).map_err(ProtocolError::MalformedJson)?;
+        if decoded.version != PROTOCOL_VERSION {
+            return Err(ProtocolError::UnsupportedVersion(u64::from(
+                decoded.version,
+            )));
+        }
+        Ok(decoded.message)
+    }
+}
+
 #[derive(Debug, Error)]
 pub enum ProtocolError {
     #[error("request exceeds the {limit}-byte limit")]
@@ -216,6 +506,8 @@ pub enum ProtocolError {
     UnsupportedVersion(u64),
     #[error("unknown request type: {0}")]
     UnknownRequestType(String),
+    #[error("request type is not renderer-redeem")]
+    UnexpectedRequestType,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -426,5 +718,60 @@ mod tests {
             cache.lookup(&first, now + Duration::from_secs(5)),
             CacheLookup::Miss
         );
+    }
+
+    #[test]
+    fn renderer_messages_round_trip_as_bounded_newline_frames() {
+        let message = RendererMessage::Initial {
+            content: RendererContent {
+                notification_id: Uuid::now_v7(),
+                presentation: Presentation::Toast,
+                level: Level::Success,
+                title: "Codex".into(),
+                body: "finished".into(),
+                source: None,
+                metadata: RendererMetadata {
+                    agent_event_kind: None,
+                    agent_name: None,
+                    tool_name: None,
+                },
+            },
+        };
+        let encoded = message.encode_line().unwrap();
+        assert_eq!(encoded.last(), Some(&b'\n'));
+        assert_eq!(
+            serde_json::from_slice::<Value>(&encoded[..encoded.len() - 1]).unwrap()["version"],
+            PROTOCOL_VERSION
+        );
+        assert_eq!(RendererMessage::decode(&encoded).unwrap(), message);
+    }
+
+    #[test]
+    fn renderer_redemption_validates_fields_and_redacts_the_token() {
+        let request_id = Uuid::now_v7();
+        let token = "ab".repeat(32);
+        let envelope = RequestEnvelope::decode(
+            format!(
+                r#"{{"version":1,"request_id":"{request_id}","type":"renderer-redeem","window_display":"display-1","token":"{token}"}}"#
+            )
+            .as_bytes(),
+        )
+        .unwrap();
+        let redemption = envelope.renderer_redemption().unwrap();
+        assert_eq!(redemption.window_display_id(), "display-1");
+        assert_eq!(redemption.token(), token);
+        assert!(!format!("{redemption:?}").contains(&token));
+
+        let malformed = RequestEnvelope::decode(
+            format!(
+                r#"{{"version":1,"request_id":"{request_id}","type":"renderer-redeem","window_display":"display-1","token":"not-secret"}}"#
+            )
+            .as_bytes(),
+        )
+        .unwrap();
+        assert!(matches!(
+            malformed.renderer_redemption(),
+            Err(ProtocolError::MissingOrInvalidField("token"))
+        ));
     }
 }
