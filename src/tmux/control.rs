@@ -3,7 +3,7 @@ use std::fmt;
 
 use super::Event;
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub(super) struct CommandTicket(pub(super) u64);
 
 #[derive(Clone, Debug, Eq, PartialEq)]

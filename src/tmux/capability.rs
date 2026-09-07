@@ -114,12 +114,14 @@ impl ProductionProbe {
             &["-C", "display-message", "-p", "tmnotify-control-probe"],
         )?;
 
-        Ok(evaluate(ProbeInput {
-            version: version.trim(),
-            commands: &commands,
-            formats: &formats,
-            control: &control,
-        }))
+        Ok(evaluate_observed(
+            version.trim(),
+            &commands,
+            &formats,
+            control.contains("%begin")
+                && control.contains("tmnotify-control-probe")
+                && control.contains("%end"),
+        ))
     }
 }
 
@@ -143,18 +145,16 @@ fn checked_utf8(output: Output) -> std::io::Result<String> {
         .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))
 }
 
-struct ProbeInput<'a> {
-    version: &'a str,
-    commands: &'a str,
-    formats: &'a str,
-    control: &'a str,
-}
-
-fn evaluate(input: ProbeInput<'_>) -> CapabilityReport {
-    let command_flags = parse_command_flags(input.commands);
-    let format_names = parse_format_names(input.formats);
+pub(super) fn evaluate_observed(
+    version: &str,
+    commands: &str,
+    formats: &str,
+    control_confirmed: bool,
+) -> CapabilityReport {
+    let command_flags = parse_command_flags(commands);
+    let format_names = parse_format_names(formats);
     let mut report = CapabilityReport {
-        version: input.version.to_owned(),
+        version: version.to_owned(),
         available: BTreeSet::new(),
         missing: BTreeMap::new(),
     };
@@ -162,9 +162,7 @@ fn evaluate(input: ProbeInput<'_>) -> CapabilityReport {
     check(
         &mut report,
         Capability::ControlMode,
-        input.control.contains("%begin")
-            && input.control.contains("tmnotify-control-probe")
-            && input.control.contains("%end"),
+        control_confirmed,
         "a -C command did not produce correlated %begin/%end framing",
     );
     check_flags(
@@ -280,12 +278,7 @@ mod tests {
     #[test]
     fn accepts_the_observed_tmux_3_8_surface() {
         let formats = formats();
-        let report = evaluate(ProbeInput {
-            version: "tmux next-3.8",
-            commands: COMMANDS,
-            formats: &formats,
-            control: "%begin 1 2 0\ntmnotify-control-probe\n%end 1 2 0\n%exit\n",
-        });
+        let report = evaluate_observed("tmux next-3.8", COMMANDS, &formats, true);
 
         assert!(report.supports_display_service(), "{:?}", report.missing);
         assert!(report.require_display_service().is_ok());
@@ -293,12 +286,12 @@ mod tests {
 
     #[test]
     fn reports_each_missing_capability_without_using_the_version_string() {
-        let report = evaluate(ProbeInput {
-            version: "tmux 99.0",
-            commands: "resize-pane [-t target-pane]\n",
-            formats: "pane_id=%1\n",
-            control: "plain output",
-        });
+        let report = evaluate_observed(
+            "tmux 99.0",
+            "resize-pane [-t target-pane]\n",
+            "pane_id=%1\n",
+            false,
+        );
         let error = report.require_display_service().unwrap_err();
 
         assert_eq!(error.missing.len(), 6);

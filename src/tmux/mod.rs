@@ -5,10 +5,8 @@
 //! do not construct tmux commands or depend on control-mode notification names.
 
 mod capability;
-// The persistent connection will consume this codec in the daemon integration
-// change. Keep raw control-mode framing private to the tmux boundary meanwhile.
-#[allow(dead_code)]
 mod control;
+mod production;
 mod topology;
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -16,6 +14,7 @@ use std::fmt;
 use std::path::PathBuf;
 
 pub use capability::{Capability, CapabilityReport, ProductionProbe, UnsupportedTmux};
+pub use production::{DEFAULT_TOPOLOGY_REFRESH_INTERVAL, ProductionBackend};
 pub use topology::{ClientView, Pane, Topology, TopologyParseError, WindowSize};
 
 /// A stable tmux window ID (`@N`).
@@ -145,6 +144,11 @@ impl Server {
         ProductionProbe::new(&self.socket_path)
             .run()
             .map_err(Error::from)
+    }
+
+    #[must_use]
+    pub fn socket_path(&self) -> &std::path::Path {
+        &self.socket_path
     }
 
     /// Takes a full topology snapshot using formats owned by this module.
