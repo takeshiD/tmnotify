@@ -6,6 +6,7 @@
 //! for the result when acknowledgement semantics require it.
 
 use std::fmt;
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::mpsc::{self, SyncSender, TrySendError};
@@ -14,9 +15,10 @@ use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 use rusqlite::{Connection, ErrorCode, OpenFlags, TransactionBehavior, params};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tokio::sync::oneshot;
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::config::HistoryConfig;
 use crate::notification::{
@@ -138,7 +140,7 @@ impl Default for HistoryQuery {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct HistoryEntry {
     pub id: NotificationId,
     pub key: Option<NotificationKey>,
@@ -157,6 +159,14 @@ pub struct HistoryEntry {
     pub hidden_at: Option<DateTime<Utc>>,
     pub last_jumped_at: Option<DateTime<Utc>>,
     pub metadata: NormalizedMetadata,
+}
+
+/// A Clear operation cannot exist without one destructive selector.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ClearFilter {
+    Hidden,
+    Before(DateTime<Utc>),
+    All,
 }
 
 /// Concrete SQLite History module for one daemon/current-server context.
@@ -278,6 +288,19 @@ impl History {
         self.submit(|reply| Command::List(query, reply))
     }
 
+    /// Physically removes matching rows in one transaction. Confirmation is a
+    /// CLI concern and must happen before this method is called.
+    pub fn clear(
+        &self,
+        filter: ClearFilter,
+        all_servers: bool,
+    ) -> Result<HistoryTask<u64>, HistoryError> {
+        if !self.enabled {
+            return Ok(ready(Ok(0)));
+        }
+        self.submit(|reply| Command::Clear(filter, all_servers, reply))
+    }
+
     /// Acts as the shutdown durability barrier. The worker processes commands
     /// serially, so completion means all earlier writes have reached SQLite.
     pub fn flush(&self) -> Result<HistoryTask<()>, HistoryError> {
@@ -331,11 +354,16 @@ enum Command {
         HistoryQuery,
         oneshot::Sender<Result<Vec<HistoryEntry>, HistoryError>>,
     ),
+    Clear(
+        ClearFilter,
+        bool,
+        oneshot::Sender<Result<u64, HistoryError>>,
+    ),
     Flush(oneshot::Sender<Result<(), HistoryError>>),
 }
 
 fn worker_loop(
-    connection: Connection,
+    mut connection: Connection,
     receiver: mpsc::Receiver<Command>,
     current_server: TmuxServerId,
     max_entries: u32,
@@ -360,11 +388,131 @@ fn worker_loop(
             Command::List(query, reply) => {
                 let _ = reply.send(list_entries(&connection, &current_server, query));
             }
+            Command::Clear(filter, all_servers, reply) => {
+                let _ = reply.send(clear_entries(
+                    &mut connection,
+                    &current_server,
+                    filter,
+                    all_servers,
+                ));
+            }
             Command::Flush(reply) => {
                 let _ = reply.send(Ok(()));
             }
         }
     }
+}
+
+fn clear_entries(
+    connection: &mut Connection,
+    current_server: &TmuxServerId,
+    filter: ClearFilter,
+    all_servers: bool,
+) -> Result<u64, HistoryError> {
+    with_busy_retry(|| {
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let deleted = match (filter, all_servers) {
+            (ClearFilter::Hidden, true) => {
+                transaction.execute("DELETE FROM notifications WHERE hidden_at IS NOT NULL", [])?
+            }
+            (ClearFilter::Hidden, false) => transaction.execute(
+                "DELETE FROM notifications WHERE hidden_at IS NOT NULL AND tmux_server_id = ?1",
+                [current_server.as_str()],
+            )?,
+            (ClearFilter::Before(before), true) => transaction.execute(
+                "DELETE FROM notifications WHERE updated_at < ?1",
+                [before.timestamp_millis()],
+            )?,
+            (ClearFilter::Before(before), false) => transaction.execute(
+                "DELETE FROM notifications WHERE updated_at < ?1 AND tmux_server_id = ?2",
+                params![before.timestamp_millis(), current_server.as_str()],
+            )?,
+            (ClearFilter::All, true) => transaction.execute("DELETE FROM notifications", [])?,
+            (ClearFilter::All, false) => transaction.execute(
+                "DELETE FROM notifications WHERE tmux_server_id = ?1",
+                [current_server.as_str()],
+            )?,
+        };
+        transaction.commit()?;
+        Ok(u64::try_from(deleted).unwrap_or(u64::MAX))
+    })
+}
+
+/// Writes one untruncated JSON object per line and never adds terminal styling.
+pub fn write_ndjson(
+    entries: &[HistoryEntry],
+    mut output: impl Write,
+) -> Result<(), HistoryOutputError> {
+    for entry in entries {
+        serde_json::to_writer(&mut output, entry)?;
+        output.write_all(b"\n")?;
+    }
+    Ok(())
+}
+
+/// Writes one borderless, terminal-cell-truncated row per Notification.
+pub fn write_plain(
+    entries: &[HistoryEntry],
+    width: usize,
+    mut output: impl Write,
+) -> Result<(), io::Error> {
+    for entry in entries {
+        let body = entry
+            .body
+            .lines()
+            .find(|line| !line.trim().is_empty())
+            .unwrap_or_default();
+        let title_separator = if entry.title.is_empty() { "" } else { " — " };
+        let row = format!(
+            "{} {:<7} {}{}{}",
+            entry.updated_at.to_rfc3339(),
+            history_level(entry.level),
+            entry.title,
+            title_separator,
+            body
+        );
+        writeln!(output, "{}", truncate_cells(&row, width))?;
+    }
+    Ok(())
+}
+
+fn history_level(level: Level) -> &'static str {
+    match level {
+        Level::Info => "info",
+        Level::Success => "success",
+        Level::Warning => "warning",
+        Level::Error => "error",
+    }
+}
+
+fn truncate_cells(value: &str, width: usize) -> String {
+    if value.width() <= width {
+        return value.to_owned();
+    }
+    if width == 0 {
+        return String::new();
+    }
+    let content_width = width - 1;
+    let mut used = 0;
+    let mut output = String::new();
+    for character in value.chars() {
+        let character_width = character.width().unwrap_or(0);
+        if used + character_width > content_width {
+            break;
+        }
+        output.push(character);
+        used += character_width;
+    }
+    output.push('…');
+    output
+}
+
+#[derive(Debug, Error)]
+pub enum HistoryOutputError {
+    #[error("failed to encode History NDJSON: {0}")]
+    Json(#[from] serde_json::Error),
+    #[error("failed to write History output: {0}")]
+    Io(#[from] io::Error),
 }
 
 fn open_connection(path: &Path) -> Result<Connection, HistoryError> {
@@ -1214,5 +1362,104 @@ mod tests {
         });
         assert!(matches!(result, Err(HistoryError::Sqlite(_))));
         assert_eq!(attempts.get(), BUSY_ATTEMPTS);
+    }
+
+    #[tokio::test]
+    async fn clear_is_scoped_and_each_selector_removes_only_matching_rows() {
+        let temporary = TempDir::new().unwrap();
+        let path = history_path(&temporary);
+        let early = DateTime::from_timestamp_millis(1_000).unwrap();
+        let late = DateTime::from_timestamp_millis(3_000).unwrap();
+        let alpha = History::open(&path, server("alpha"), &config(100), early).unwrap();
+        let beta = History::open(&path, server("beta"), &config(100), early).unwrap();
+        let hidden = notification("alpha", "hidden", early);
+        alpha.persist(&hidden).unwrap().wait().await.unwrap();
+        alpha.hide(hidden.id(), late).unwrap().wait().await.unwrap();
+        alpha
+            .persist(&notification("alpha", "late", late))
+            .unwrap()
+            .wait()
+            .await
+            .unwrap();
+        beta.persist(&notification("beta", "other", early))
+            .unwrap()
+            .wait()
+            .await
+            .unwrap();
+
+        assert_eq!(
+            alpha
+                .clear(ClearFilter::Hidden, false)
+                .unwrap()
+                .wait()
+                .await
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            alpha
+                .clear(ClearFilter::Before(late), false)
+                .unwrap()
+                .wait()
+                .await
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            alpha
+                .clear(ClearFilter::All, false)
+                .unwrap()
+                .wait()
+                .await
+                .unwrap(),
+            1
+        );
+        let remaining = beta
+            .list(HistoryQuery {
+                all_servers: true,
+                ..HistoryQuery::default()
+            })
+            .unwrap()
+            .wait()
+            .await
+            .unwrap();
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].body, "other");
+    }
+
+    #[tokio::test]
+    async fn plain_is_cell_bounded_and_ndjson_is_complete_one_object_per_line() {
+        let temporary = TempDir::new().unwrap();
+        let path = history_path(&temporary);
+        let now = DateTime::from_timestamp_millis(1_700_000_000_000).unwrap();
+        let history = History::open(&path, server("alpha"), &config(100), now).unwrap();
+        history
+            .persist(&notification("alpha", "日本語🙂 complete body", now))
+            .unwrap()
+            .wait()
+            .await
+            .unwrap();
+        let entries = history
+            .list(HistoryQuery::default())
+            .unwrap()
+            .wait()
+            .await
+            .unwrap();
+
+        let mut plain = Vec::new();
+        write_plain(&entries, 24, &mut plain).unwrap();
+        let plain = String::from_utf8(plain).unwrap();
+        assert_eq!(plain.lines().count(), 1);
+        assert!(plain.trim_end().width() <= 24);
+        assert!(plain.contains('…'));
+        assert!(!plain.contains("\u{1b}"));
+
+        let mut json = Vec::new();
+        write_ndjson(&entries, &mut json).unwrap();
+        let json = String::from_utf8(json).unwrap();
+        assert_eq!(json.lines().count(), 1);
+        let decoded: serde_json::Value = serde_json::from_str(json.trim_end()).unwrap();
+        assert_eq!(decoded["body"], "日本語🙂 complete body");
+        assert_eq!(decoded["tmux_server_id"], "alpha");
     }
 }
