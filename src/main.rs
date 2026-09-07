@@ -1,3 +1,5 @@
+use clap::Parser;
+
 fn main() {
-    println!("Hello, world!");
+    let _cli = tmnotify::cli::Cli::parse();
 }
