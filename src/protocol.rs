@@ -12,7 +12,7 @@ use serde_json::Value;
 use thiserror::Error;
 use uuid::Uuid;
 
-use crate::notification::{Level, Notification, Presentation, Provider};
+use crate::notification::{Level, Notification, Presentation, Provider, Timeout};
 
 pub const PROTOCOL_VERSION: u16 = 1;
 pub const MAX_REQUEST_BYTES: usize = 64 * 1024;
@@ -268,8 +268,11 @@ pub struct RendererContent {
     notification_id: Uuid,
     presentation: Presentation,
     level: Level,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    notification_key: Option<String>,
     title: String,
     body: String,
+    timeout: Timeout,
     #[serde(skip_serializing_if = "Option::is_none")]
     source: Option<RendererSource>,
     metadata: RendererMetadata,
@@ -291,6 +294,13 @@ impl RendererContent {
         self.level
     }
 
+    /// A live direct-jump handle. Renderers may advertise the command, but
+    /// must never turn their display surface into an input target.
+    #[must_use]
+    pub fn notification_key(&self) -> Option<&str> {
+        self.notification_key.as_deref()
+    }
+
     #[must_use]
     pub fn title(&self) -> &str {
         &self.title
@@ -299,6 +309,11 @@ impl RendererContent {
     #[must_use]
     pub fn body(&self) -> &str {
         &self.body
+    }
+
+    #[must_use]
+    pub fn timeout(&self) -> Timeout {
+        self.timeout
     }
 
     #[must_use]
@@ -329,8 +344,10 @@ impl From<&Notification> for RendererContent {
             notification_id: notification.id().as_uuid(),
             presentation: notification.presentation(),
             level: notification.level(),
+            notification_key: notification.key().map(|key| key.as_str().to_owned()),
             title: notification.title().to_owned(),
             body: notification.body().to_owned(),
+            timeout: notification.timeout(),
             source,
             metadata: RendererMetadata {
                 agent_event_kind: metadata.agent_event_kind(),
@@ -727,8 +744,10 @@ mod tests {
                 notification_id: Uuid::now_v7(),
                 presentation: Presentation::Toast,
                 level: Level::Success,
+                notification_key: Some("build".into()),
                 title: "Codex".into(),
                 body: "finished".into(),
+                timeout: Timeout::Never,
                 source: None,
                 metadata: RendererMetadata {
                     agent_event_kind: None,
