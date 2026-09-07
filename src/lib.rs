@@ -10,3 +10,4 @@ pub mod protocol;
 pub mod providers;
 pub mod render;
 pub mod tmux;
+pub mod ui;
