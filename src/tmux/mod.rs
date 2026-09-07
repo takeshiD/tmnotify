@@ -11,12 +11,12 @@ mod capability;
 mod control;
 mod topology;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::path::PathBuf;
 
 pub use capability::{Capability, CapabilityReport, ProductionProbe, UnsupportedTmux};
-pub use topology::{ClientView, Pane, Topology, TopologyParseError};
+pub use topology::{ClientView, Pane, Topology, TopologyParseError, WindowSize};
 
 /// A stable tmux window ID (`@N`).
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -29,7 +29,7 @@ pub struct PaneId(pub String);
 /// Desired displays keyed by Attention Window.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct DisplayPlan {
-    pub windows: BTreeMap<WindowId, PlannedDisplay>,
+    pub windows: BTreeMap<WindowId, Vec<PlannedDisplay>>,
 }
 
 /// The renderer identity and geometry desired in one Attention Window.
@@ -38,6 +38,16 @@ pub struct PlannedDisplay {
     pub display_id: String,
     pub kind: DisplayKind,
     pub geometry: Geometry,
+    /// Follow/retry recreations must not replay a Notification's entrance.
+    pub play_enter_animation: bool,
+}
+
+/// Per-window result of applying a desired plan. The backend owns the actual
+/// pane identities and command diff; the daemon only reasons about windows.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct ReconcileReport {
+    pub applied: BTreeSet<WindowId>,
+    pub failed: BTreeMap<WindowId, String>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -114,7 +124,7 @@ pub trait Backend {
     fn capabilities(&mut self) -> Result<CapabilityReport, Error>;
     fn topology(&mut self) -> Result<Topology, Error>;
     fn next_event(&mut self) -> Result<Option<Event>, Error>;
-    fn reconcile(&mut self, desired: &DisplayPlan) -> Result<(), Error>;
+    fn reconcile(&mut self, desired: &DisplayPlan) -> Result<ReconcileReport, Error>;
     fn jump(&mut self, target: &JumpTarget) -> Result<(), Error>;
 }
 
@@ -172,6 +182,7 @@ pub(crate) mod fake {
         pub topology: Topology,
         pub events: VecDeque<Event>,
         pub plans: Vec<DisplayPlan>,
+        pub reconcile_results: VecDeque<Result<ReconcileReport, String>>,
         pub jumps: Vec<JumpTarget>,
     }
 
@@ -182,6 +193,7 @@ pub(crate) mod fake {
                 topology,
                 events: VecDeque::new(),
                 plans: Vec::new(),
+                reconcile_results: VecDeque::new(),
                 jumps: Vec::new(),
             }
         }
@@ -200,9 +212,15 @@ pub(crate) mod fake {
             Ok(self.events.pop_front())
         }
 
-        fn reconcile(&mut self, desired: &DisplayPlan) -> Result<(), Error> {
+        fn reconcile(&mut self, desired: &DisplayPlan) -> Result<ReconcileReport, Error> {
             self.plans.push(desired.clone());
-            Ok(())
+            if let Some(result) = self.reconcile_results.pop_front() {
+                return result.map_err(Error::Protocol);
+            }
+            Ok(ReconcileReport {
+                applied: desired.windows.keys().cloned().collect(),
+                failed: BTreeMap::new(),
+            })
         }
 
         fn jump(&mut self, target: &JumpTarget) -> Result<(), Error> {
@@ -217,7 +235,7 @@ pub(crate) mod fake {
         let mut plan = DisplayPlan::default();
         plan.windows.insert(
             WindowId("@4".into()),
-            PlannedDisplay {
+            vec![PlannedDisplay {
                 display_id: "display-1".into(),
                 kind: DisplayKind::Attention,
                 geometry: Geometry {
@@ -227,7 +245,8 @@ pub(crate) mod fake {
                     height: 9,
                     z_index: 5,
                 },
-            },
+                play_enter_animation: true,
+            }],
         );
         let jump = JumpTarget {
             pane_id: PaneId("%9".into()),

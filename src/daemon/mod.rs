@@ -5,6 +5,12 @@
 //! [`DisplayPlan`] through the tmux boundary and commit a [`JumpIntent`] only
 //! after that boundary reports a successful pane switch.
 
+mod reconcile;
+
+pub use reconcile::{
+    ReconcileError, ReconcileOutcome, ReconcileStatus, WindowDisplayPolicy, WindowReconciler,
+};
+
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt;
 use std::time::Duration;
@@ -238,6 +244,7 @@ pub struct LiveScheduler {
     next_sequence: u64,
     next_jump_nonce: u64,
     revision: u64,
+    content_revision: u64,
     last_now: MonotonicTime,
 }
 
@@ -261,6 +268,7 @@ impl LiveScheduler {
             next_sequence: 0,
             next_jump_nonce: 0,
             revision: 0,
+            content_revision: 0,
             last_now: now,
         }
     }
@@ -302,7 +310,7 @@ impl LiveScheduler {
             }
             self.sort_pending();
             self.rebalance(monotonic_now, wall_now)?;
-            self.bump_revision();
+            self.bump_content_revision();
             return Ok(SubmitOutcome {
                 id,
                 disposition: SubmitDisposition::Updated,
@@ -329,7 +337,7 @@ impl LiveScheduler {
         self.sort_pending();
         self.rebalance(monotonic_now, wall_now)?;
         let suppressed = self.enforce_pending_limit(wall_now);
-        self.bump_revision();
+        self.bump_content_revision();
 
         let disposition = if suppressed.contains(&id) {
             SubmitDisposition::Suppressed
@@ -387,7 +395,7 @@ impl LiveScheduler {
             .timeout
             .restart(entry.notification.timeout(), monotonic_now, running);
         self.sort_pending();
-        self.bump_revision();
+        self.bump_content_revision();
         Ok(UpdateDisposition::Updated)
     }
 
@@ -605,6 +613,13 @@ impl LiveScheduler {
         self.entries.len()
     }
 
+    /// Changes only when Notification content or lifecycle changes, not when
+    /// display availability pauses and resumes the same live work.
+    #[must_use]
+    pub(crate) fn content_revision(&self) -> u64 {
+        self.content_revision
+    }
+
     fn prepare_time(
         &mut self,
         monotonic_now: MonotonicTime,
@@ -653,7 +668,6 @@ impl LiveScheduler {
         }
         self.close_inner(id, reason, wall_now);
         self.rebalance(monotonic_now, wall_now)?;
-        self.bump_revision();
         Ok(())
     }
 
@@ -674,7 +688,7 @@ impl LiveScheduler {
             self.closed.pop_front();
         }
         self.closed.push_back(entry.notification);
-        self.bump_revision();
+        self.bump_content_revision();
     }
 
     fn rebalance(
@@ -781,6 +795,11 @@ impl LiveScheduler {
 
     fn bump_revision(&mut self) {
         self.revision = self.revision.wrapping_add(1);
+    }
+
+    fn bump_content_revision(&mut self) {
+        self.content_revision = self.content_revision.wrapping_add(1);
+        self.bump_revision();
     }
 }
 

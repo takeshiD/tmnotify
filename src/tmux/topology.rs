@@ -37,6 +37,32 @@ impl Topology {
             .map(|client| client.window_id.clone())
             .collect()
     }
+
+    /// Best available size for a window from its tiled panes. Floating panes
+    /// are excluded because their extents do not describe the underlying
+    /// Attention Window.
+    #[must_use]
+    pub fn window_size(&self, window_id: &WindowId) -> Option<WindowSize> {
+        let mut width = 0_u16;
+        let mut height = 0_u16;
+        let mut found = false;
+        for pane in self
+            .panes
+            .values()
+            .filter(|pane| pane.window_id == *window_id && !pane.is_floating)
+        {
+            found = true;
+            width = width.max(pane.left.saturating_add(pane.width));
+            height = height.max(pane.top.saturating_add(pane.height));
+        }
+        found.then_some(WindowSize { width, height })
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct WindowSize {
+    pub width: u16,
+    pub height: u16,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -162,6 +188,13 @@ mod tests {
 
         assert_eq!(topology.eligible_windows(), [WindowId("@1".into())].into());
         assert!(topology.panes[&PaneId("%8".into())].is_floating);
+        assert_eq!(
+            topology.window_size(&WindowId("@1".into())),
+            Some(WindowSize {
+                width: 80,
+                height: 24
+            })
+        );
     }
 
     #[test]
