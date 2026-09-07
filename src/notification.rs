@@ -450,6 +450,79 @@ pub struct NotificationDraft {
     metadata: NormalizedMetadata,
 }
 
+/// Validated, partial changes for a live Notification.
+///
+/// Identity, presentation, and Source Context are deliberately immutable here.
+/// A producer that wants to replace all send-time content can use keyed upsert.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct NotificationUpdate {
+    title: Option<String>,
+    body: Option<String>,
+    level: Option<Level>,
+    priority: Option<Priority>,
+    timeout: Option<Timeout>,
+    overrides: Option<PresentationOverrides>,
+}
+
+impl NotificationUpdate {
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn with_title(mut self, value: &str) -> Result<Self, IngressError> {
+        self.title = Some(normalize_bounded(
+            "Notification title",
+            value,
+            MAX_TITLE_BYTES,
+        )?);
+        Ok(self)
+    }
+
+    pub fn with_body(mut self, value: &str) -> Result<Self, IngressError> {
+        self.body = Some(normalize_bounded(
+            "Notification body",
+            value,
+            MAX_BODY_BYTES,
+        )?);
+        Ok(self)
+    }
+
+    #[must_use]
+    pub fn with_level(mut self, value: Level) -> Self {
+        self.level = Some(value);
+        self
+    }
+
+    #[must_use]
+    pub fn with_priority(mut self, value: Priority) -> Self {
+        self.priority = Some(value);
+        self
+    }
+
+    #[must_use]
+    pub fn with_timeout(mut self, value: Timeout) -> Self {
+        self.timeout = Some(value);
+        self
+    }
+
+    #[must_use]
+    pub fn with_overrides(mut self, value: PresentationOverrides) -> Self {
+        self.overrides = Some(value);
+        self
+    }
+
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.title.is_none()
+            && self.body.is_none()
+            && self.level.is_none()
+            && self.priority.is_none()
+            && self.timeout.is_none()
+            && self.overrides.is_none()
+    }
+}
+
 impl NotificationDraft {
     pub fn new(
         presentation: Presentation,
@@ -510,6 +583,11 @@ impl NotificationDraft {
     pub fn with_metadata(mut self, metadata: NormalizedMetadata) -> Self {
         self.metadata = metadata;
         self
+    }
+
+    #[must_use]
+    pub(crate) fn key(&self) -> Option<&NotificationKey> {
+        self.key.as_ref()
     }
 }
 
@@ -625,6 +703,75 @@ impl Notification {
     #[must_use]
     pub fn metadata(&self) -> &NormalizedMetadata {
         &self.metadata
+    }
+
+    pub(crate) fn has_same_content(&self, draft: &NotificationDraft) -> bool {
+        self.key == draft.key
+            && self.level == draft.level
+            && self.priority == draft.priority
+            && self.presentation == draft.presentation
+            && self.title == draft.title
+            && self.body == draft.body
+            && self.timeout == draft.timeout
+            && self.source == draft.source
+            && self.overrides == draft.overrides
+            && self.metadata == draft.metadata
+    }
+
+    pub(crate) fn replace_content(&mut self, draft: NotificationDraft, now: DateTime<Utc>) {
+        self.key = draft.key;
+        self.level = draft.level;
+        self.priority = draft.priority;
+        self.presentation = draft.presentation;
+        self.title = draft.title;
+        self.body = draft.body;
+        self.timeout = draft.timeout;
+        self.source = draft.source;
+        self.overrides = draft.overrides;
+        self.metadata = draft.metadata;
+        self.updated_at = now;
+    }
+
+    pub(crate) fn apply_update(&mut self, update: NotificationUpdate, now: DateTime<Utc>) -> bool {
+        let mut changed = false;
+        macro_rules! replace_if_changed {
+            ($field:ident) => {
+                if let Some(value) = update.$field {
+                    if self.$field != value {
+                        self.$field = value;
+                        changed = true;
+                    }
+                }
+            };
+        }
+        replace_if_changed!(title);
+        replace_if_changed!(body);
+        replace_if_changed!(level);
+        replace_if_changed!(priority);
+        replace_if_changed!(overrides);
+        if self.presentation == Presentation::Toast {
+            replace_if_changed!(timeout);
+        }
+        if changed {
+            self.updated_at = now;
+        }
+        changed
+    }
+
+    pub(crate) fn mark_visible(&mut self, now: DateTime<Utc>) {
+        if self.delivery == DeliveryState::Pending {
+            self.delivery = DeliveryState::Visible;
+            self.updated_at = now;
+        }
+    }
+
+    pub(crate) fn close(&mut self, reason: CloseReason, now: DateTime<Utc>) {
+        self.delivery = DeliveryState::Closed;
+        self.close_reason = Some(reason);
+        self.updated_at = now;
+        if reason == CloseReason::Jumped {
+            self.last_jumped_at = Some(now);
+        }
     }
 }
 
