@@ -20,6 +20,10 @@ _Avoid_: Decision dialog, approval UI
 同じ進行中の出来事について送られた複数の Notification を対応付ける、producer が指定する論理的な識別子。後から届いた内容で既存の Notification を更新するために使う。
 _Avoid_: Deduplication key, database ID
 
+Notification Key が付いた live Notification は、`tmnotify jump --key` から
+Source Pane へ直接戻る対象にもできる。これはキーボードの key binding とは
+異なる概念であり、Notification Key を tmux command や shell command に展開しない。
+
 **Source Pane**:
 Notification の原因となった処理が実行されていた tmux pane。Notification の表示場所とは限らない。
 _Avoid_: Target pane
