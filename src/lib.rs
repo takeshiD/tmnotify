@@ -1,5 +1,6 @@
 //! Core library for tmnotify.
 
+pub mod app;
 pub mod cli;
 pub mod config;
 pub mod daemon;
