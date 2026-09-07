@@ -1,4 +1,5 @@
 pub mod attention;
+pub mod history;
 
 use std::io::{self, Stdout, stdout};
 
