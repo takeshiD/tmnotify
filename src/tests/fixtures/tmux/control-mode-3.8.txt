@@ -1,0 +1,10 @@
+%begin 1788793631 317 1
+%session-changed $0 source
+$0|@0|%0
+%end 1788793631 317 1
+%window-add @1
+%session-window-changed $0 @1
+%layout-change @1 419a,80x24,0,0[80x12,0,0,1,80x11,0,13,2] 419a,80x24,0,0[80x12,0,0,1,80x11,0,13,2] *
+%window-close @1
+%output %0 ignored-pane-output
+%exit
