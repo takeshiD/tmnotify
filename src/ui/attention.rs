@@ -1,4 +1,5 @@
 use std::io;
+use std::time::Duration;
 
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use ratatui::{
@@ -10,7 +11,7 @@ use ratatui::{
 };
 use thiserror::Error;
 
-use super::TerminalSession;
+use super::{InterruptWatcher, TerminalSession};
 use crate::notification::{Notification, Presentation};
 
 pub const COMPACT_MIN_WIDTH: u16 = 32;
@@ -92,9 +93,17 @@ pub enum AttentionOutcome {
 /// Runs only the renderer event loop. Jump execution remains a daemon/tmux
 /// responsibility so pane selection and global lifecycle stay coordinated.
 pub fn run(state: &AttentionState) -> Result<AttentionOutcome, AttentionError> {
+    const EVENT_POLL_INTERVAL: Duration = Duration::from_millis(50);
     let mut terminal = TerminalSession::enter()?;
+    let interrupt = InterruptWatcher::new()?;
     loop {
         terminal.terminal_mut().draw(|frame| render(frame, state))?;
+        if interrupt.is_interrupted() {
+            return Ok(AttentionOutcome::Interrupted);
+        }
+        if !event::poll(EVENT_POLL_INTERVAL)? {
+            continue;
+        }
         match event::read()? {
             Event::Key(key) => match state.handle_key(key) {
                 AttentionCommand::Jump => return Ok(AttentionOutcome::JumpRequested),

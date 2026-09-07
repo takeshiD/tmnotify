@@ -2,6 +2,10 @@ pub mod attention;
 pub mod history;
 
 use std::io::{self, Stdout, stdout};
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
 
 use crossterm::{
     cursor::{Hide, Show},
@@ -9,6 +13,48 @@ use crossterm::{
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
 use ratatui::{Terminal, backend::CrosstermBackend};
+
+#[cfg(unix)]
+use signal_hook::{
+    SigId,
+    consts::signal::{SIGINT, SIGTERM},
+};
+
+pub struct InterruptWatcher {
+    interrupted: Arc<AtomicBool>,
+    #[cfg(unix)]
+    registrations: Vec<SigId>,
+}
+
+impl InterruptWatcher {
+    pub fn new() -> io::Result<Self> {
+        let interrupted = Arc::new(AtomicBool::new(false));
+        #[cfg(unix)]
+        let registrations = [SIGINT, SIGTERM]
+            .into_iter()
+            .map(|signal| signal_hook::flag::register(signal, Arc::clone(&interrupted)))
+            .collect::<io::Result<Vec<_>>>()?;
+        Ok(Self {
+            interrupted,
+            #[cfg(unix)]
+            registrations,
+        })
+    }
+
+    #[must_use]
+    pub fn is_interrupted(&self) -> bool {
+        self.interrupted.load(Ordering::Relaxed)
+    }
+}
+
+#[cfg(unix)]
+impl Drop for InterruptWatcher {
+    fn drop(&mut self) {
+        for registration in self.registrations.drain(..) {
+            signal_hook::low_level::unregister(registration);
+        }
+    }
+}
 
 /// Owns every terminal mode changed by an interactive view.
 /// Drop is best-effort so errors and panics still attempt all cleanup.

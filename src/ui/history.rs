@@ -17,7 +17,7 @@ use ratatui::{
     widgets::{Block, Borders, Clear, Paragraph, Wrap},
 };
 
-use super::TerminalSession;
+use super::{InterruptWatcher, TerminalSession};
 use crate::history::{History, HistoryEntry, HistoryQuery};
 use crate::notification::{Level, NotificationId, SourceContext, TmuxServerId};
 
@@ -466,9 +466,22 @@ pub enum HistoryUiError {
 pub trait HistoryEventSource {
     fn poll(&mut self, timeout: Duration) -> io::Result<bool>;
     fn read(&mut self) -> io::Result<Event>;
+    fn interrupted(&self) -> bool {
+        false
+    }
 }
 
-pub struct CrosstermEvents;
+pub struct CrosstermEvents {
+    interrupt: InterruptWatcher,
+}
+
+impl CrosstermEvents {
+    pub fn new() -> io::Result<Self> {
+        Ok(Self {
+            interrupt: InterruptWatcher::new()?,
+        })
+    }
+}
 
 impl HistoryEventSource for CrosstermEvents {
     fn poll(&mut self, timeout: Duration) -> io::Result<bool> {
@@ -477,6 +490,10 @@ impl HistoryEventSource for CrosstermEvents {
 
     fn read(&mut self) -> io::Result<Event> {
         event::read()
+    }
+
+    fn interrupted(&self) -> bool {
+        self.interrupt.is_interrupted()
     }
 }
 
@@ -556,7 +573,7 @@ pub fn run(
     backend: impl HistoryActionBackend,
 ) -> Result<HistoryOutcome, HistoryUiError> {
     let mut terminal = TerminalSession::enter()?;
-    let mut events = CrosstermEvents;
+    let mut events = CrosstermEvents::new()?;
     run_with_terminal(terminal.terminal_mut(), &mut events, launch, backend)
 }
 
@@ -580,6 +597,9 @@ where
         .map_err(|_| HistoryUiError::WorkerDisconnected)?;
 
     loop {
+        if events.interrupted() {
+            return Ok(HistoryOutcome::Interrupted);
+        }
         if let Some(outcome) = apply_worker_replies(&mut view, &bridge)? {
             return Ok(outcome);
         }
