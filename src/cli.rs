@@ -6,11 +6,16 @@
 use std::ffi::OsString;
 use std::io::{self, Read};
 use std::path::PathBuf;
+use std::time::Duration;
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use thiserror::Error;
 
-use crate::notification::MAX_IPC_REQUEST_BYTES;
+use crate::notification::{
+    IngressError, Level, MAX_IPC_REQUEST_BYTES, NotificationDraft, NotificationKey,
+    NotificationUpdate, Placement, Presentation, PresentationOverrides, Priority, SourceContext,
+    Timeout,
+};
 
 #[derive(Debug, Parser, PartialEq)]
 #[command(name = "tmnotify", version, about)]
@@ -304,6 +309,128 @@ impl Cli {
     }
 }
 
+impl SendArgs {
+    pub fn into_draft(
+        self,
+        source: Option<SourceContext>,
+        stdin: impl Read,
+    ) -> Result<NotificationDraft, CliBuildError> {
+        let body = message_or_stdin(&self.message, stdin)?;
+        let presentation = if self.attention {
+            Presentation::Attention
+        } else {
+            Presentation::Toast
+        };
+        let source = if self.no_source { None } else { source };
+        let mut draft = NotificationDraft::new(
+            presentation,
+            self.title.as_deref().unwrap_or_default(),
+            &body,
+            source,
+        )?
+        .with_level(self.level.into())
+        .with_priority(self.priority.into());
+        if let Some(timeout) = self.timeout {
+            draft = draft.with_timeout(parse_timeout(&timeout)?);
+        }
+        if let Some(position) = self.position {
+            draft = draft
+                .with_overrides(PresentationOverrides::default().with_position(position.into()));
+        }
+        if let Some(key) = self.key {
+            draft = draft.with_key(NotificationKey::new(&key)?);
+        }
+        Ok(draft)
+    }
+}
+
+impl UpdateArgs {
+    pub fn into_update(self, stdin: impl Read) -> Result<NotificationUpdate, CliBuildError> {
+        let mut update = NotificationUpdate::new();
+        if let Some(title) = self.title {
+            update = update.with_title(&title)?;
+        }
+        if let Some(message) = self.message {
+            update = update.with_body(&message_or_stdin(&message, stdin)?)?;
+        }
+        if let Some(level) = self.level {
+            update = update.with_level(level.into());
+        }
+        if let Some(priority) = self.priority {
+            update = update.with_priority(priority.into());
+        }
+        if let Some(timeout) = self.timeout {
+            update = update.with_timeout(parse_timeout(&timeout)?);
+        }
+        if let Some(position) = self.position {
+            update = update
+                .with_overrides(PresentationOverrides::default().with_position(position.into()));
+        }
+        if update.is_empty() {
+            return Err(CliBuildError::EmptyUpdate);
+        }
+        Ok(update)
+    }
+}
+
+fn parse_timeout(value: &str) -> Result<Timeout, CliBuildError> {
+    if value == "never" {
+        return Ok(Timeout::Never);
+    }
+    let (number, multiplier) = if let Some(number) = value.strip_suffix("ms") {
+        (number, 1_u64)
+    } else if let Some(number) = value.strip_suffix('s') {
+        (number, 1_000)
+    } else if let Some(number) = value.strip_suffix('m') {
+        (number, 60_000)
+    } else if let Some(number) = value.strip_suffix('h') {
+        (number, 3_600_000)
+    } else {
+        return Err(CliBuildError::InvalidTimeout);
+    };
+    let number: u64 = number.parse().map_err(|_| CliBuildError::InvalidTimeout)?;
+    let milliseconds = number
+        .checked_mul(multiplier)
+        .filter(|value| *value <= 86_400_000)
+        .ok_or(CliBuildError::InvalidTimeout)?;
+    Ok(Timeout::After(Duration::from_millis(milliseconds)))
+}
+
+impl From<LevelArg> for Level {
+    fn from(value: LevelArg) -> Self {
+        match value {
+            LevelArg::Info => Self::Info,
+            LevelArg::Success => Self::Success,
+            LevelArg::Warning => Self::Warning,
+            LevelArg::Error => Self::Error,
+        }
+    }
+}
+
+impl From<PriorityArg> for Priority {
+    fn from(value: PriorityArg) -> Self {
+        match value {
+            PriorityArg::Low => Self::Low,
+            PriorityArg::Normal => Self::Normal,
+            PriorityArg::High => Self::High,
+            PriorityArg::Critical => Self::Critical,
+        }
+    }
+}
+
+impl From<PlacementArg> for Placement {
+    fn from(value: PlacementArg) -> Self {
+        match value {
+            PlacementArg::TopLeft => Self::TopLeft,
+            PlacementArg::TopCenter => Self::TopCenter,
+            PlacementArg::TopRight => Self::TopRight,
+            PlacementArg::BottomLeft => Self::BottomLeft,
+            PlacementArg::BottomCenter => Self::BottomCenter,
+            PlacementArg::BottomRight => Self::BottomRight,
+        }
+    }
+}
+
 fn parse_tmux_socket(value: &str) -> Result<Option<PathBuf>, CliError> {
     if value.is_empty() {
         return Ok(None);
@@ -362,9 +489,28 @@ pub enum CliError {
     ReadStdin(io::Error),
 }
 
+#[derive(Debug, Error)]
+pub enum CliBuildError {
+    #[error(transparent)]
+    Cli(#[from] CliError),
+    #[error(transparent)]
+    Ingress(#[from] IngressError),
+    #[error("timeout must be never or an integer with ms, s, m, or h suffix up to 24h")]
+    InvalidTimeout,
+    #[error("update requires at least one changed field")]
+    EmptyUpdate,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::Utc;
+
+    use crate::notification::{Notification, TmuxServerId};
+
+    fn source() -> SourceContext {
+        SourceContext::new(TmuxServerId::new("server").unwrap(), "$1", "@2", "%3").unwrap()
+    }
 
     #[test]
     fn parses_documented_send_defaults_and_key() {
@@ -460,5 +606,125 @@ mod tests {
                 }),
             })
         );
+    }
+
+    #[test]
+    fn send_builds_a_normalized_keyed_draft_and_honors_no_source() {
+        let cli = parse_from([
+            "tmnotify",
+            "send",
+            "--key",
+            "build",
+            "--level",
+            "success",
+            "--priority",
+            "high",
+            "--timeout",
+            "2s",
+            "--position",
+            "bottom-right",
+            "done\u{1b}[31m",
+        ])
+        .unwrap();
+        let Command::Send(arguments) = cli.command else {
+            panic!("expected send");
+        };
+        let notification = Notification::from_draft(
+            arguments.into_draft(Some(source()), io::empty()).unwrap(),
+            Utc::now(),
+        );
+        assert_eq!(notification.body(), "done");
+        assert_eq!(notification.key().unwrap().as_str(), "build");
+        assert_eq!(notification.level(), Level::Success);
+        assert_eq!(notification.priority(), Priority::High);
+        assert_eq!(
+            notification.timeout(),
+            Timeout::After(Duration::from_secs(2))
+        );
+        assert_eq!(
+            notification.overrides().position(),
+            Some(Placement::BottomRight)
+        );
+
+        let cli = parse_from(["tmnotify", "send", "--no-source", "done"]).unwrap();
+        let Command::Send(arguments) = cli.command else {
+            panic!("expected send");
+        };
+        let notification = Notification::from_draft(
+            arguments.into_draft(Some(source()), io::empty()).unwrap(),
+            Utc::now(),
+        );
+        assert!(notification.source().is_none());
+    }
+
+    #[test]
+    fn attention_requires_captured_source_and_forces_never_timeout() {
+        let parse_attention = || {
+            parse_from([
+                "tmnotify",
+                "send",
+                "--attention",
+                "--timeout",
+                "2s",
+                "input",
+            ])
+            .unwrap()
+        };
+        let Command::Send(arguments) = parse_attention().command else {
+            panic!("expected send");
+        };
+        assert!(matches!(
+            arguments.into_draft(None, io::empty()),
+            Err(CliBuildError::Ingress(
+                IngressError::AttentionRequiresSource
+            ))
+        ));
+
+        let Command::Send(arguments) = parse_attention().command else {
+            panic!("expected send");
+        };
+        let notification = Notification::from_draft(
+            arguments.into_draft(Some(source()), io::empty()).unwrap(),
+            Utc::now(),
+        );
+        assert_eq!(notification.timeout(), Timeout::Never);
+    }
+
+    #[test]
+    fn update_builds_partial_domain_changes_and_rejects_bad_timeout_or_empty() {
+        let cli = parse_from([
+            "tmnotify",
+            "update",
+            "--key",
+            "build",
+            "--timeout",
+            "never",
+            "-",
+        ])
+        .unwrap();
+        let Command::Update(arguments) = cli.command else {
+            panic!("expected update");
+        };
+        let update = arguments.into_update(&b"done\nnow"[..]).unwrap();
+        assert_eq!(update.body(), Some("done\nnow"));
+        assert_eq!(update.timeout(), Some(Timeout::Never));
+
+        let cli = parse_from(["tmnotify", "update", "--key", "build", "--timeout", "2d"]).unwrap();
+        let Command::Update(arguments) = cli.command else {
+            panic!("expected update");
+        };
+        assert!(matches!(
+            arguments.into_update(io::empty()),
+            Err(CliBuildError::InvalidTimeout)
+        ));
+
+        let cli = parse_from(["tmnotify", "update", "--key", "build"]).unwrap();
+        let Command::Update(arguments) = cli.command else {
+            panic!("expected update");
+        };
+        assert!(matches!(
+            arguments.into_update(io::empty()),
+            Err(CliBuildError::EmptyUpdate)
+        ));
     }
 }
