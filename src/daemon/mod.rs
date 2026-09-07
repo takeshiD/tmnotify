@@ -6,10 +6,12 @@
 //! after that boundary reports a successful pane switch.
 
 mod reconcile;
+mod service;
 
 pub use reconcile::{
     ReconcileError, ReconcileOutcome, ReconcileStatus, WindowDisplayPolicy, WindowReconciler,
 };
+pub use service::{DaemonService, JumpExecutor, ServiceError, ServiceResponse};
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt;
@@ -591,6 +593,10 @@ impl LiveScheduler {
     #[must_use]
     pub fn notification(&self, id: NotificationId) -> Option<&Notification> {
         self.entries.get(&id).map(|entry| &entry.notification)
+    }
+
+    pub(crate) fn id_for_key(&self, key: &NotificationKey) -> Option<NotificationId> {
+        self.live_keys.get(key).copied()
     }
 
     /// Closed lifecycle records waiting for the daemon to forward them to History.
