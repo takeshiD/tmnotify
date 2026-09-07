@@ -521,6 +521,30 @@ impl NotificationUpdate {
             && self.timeout.is_none()
             && self.overrides.is_none()
     }
+
+    pub(crate) fn title(&self) -> Option<&str> {
+        self.title.as_deref()
+    }
+
+    pub(crate) fn body(&self) -> Option<&str> {
+        self.body.as_deref()
+    }
+
+    pub(crate) fn level(&self) -> Option<Level> {
+        self.level
+    }
+
+    pub(crate) fn priority(&self) -> Option<Priority> {
+        self.priority
+    }
+
+    pub(crate) fn timeout(&self) -> Option<Timeout> {
+        self.timeout
+    }
+
+    pub(crate) fn overrides(&self) -> Option<&PresentationOverrides> {
+        self.overrides.as_ref()
+    }
 }
 
 impl NotificationDraft {
@@ -588,6 +612,42 @@ impl NotificationDraft {
     #[must_use]
     pub(crate) fn key(&self) -> Option<&NotificationKey> {
         self.key.as_ref()
+    }
+
+    pub(crate) fn level(&self) -> Level {
+        self.level
+    }
+
+    pub(crate) fn priority(&self) -> Priority {
+        self.priority
+    }
+
+    pub(crate) fn presentation(&self) -> Presentation {
+        self.presentation
+    }
+
+    pub(crate) fn title(&self) -> &str {
+        &self.title
+    }
+
+    pub(crate) fn body(&self) -> &str {
+        &self.body
+    }
+
+    pub(crate) fn timeout(&self) -> Timeout {
+        self.timeout
+    }
+
+    pub(crate) fn source(&self) -> Option<&SourceContext> {
+        self.source.as_ref()
+    }
+
+    pub(crate) fn overrides(&self) -> &PresentationOverrides {
+        &self.overrides
+    }
+
+    pub(crate) fn metadata(&self) -> &NormalizedMetadata {
+        &self.metadata
     }
 }
 

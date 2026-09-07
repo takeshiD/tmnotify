@@ -12,7 +12,11 @@ use serde_json::Value;
 use thiserror::Error;
 use uuid::Uuid;
 
-use crate::notification::{Level, Notification, Presentation, Provider, Timeout};
+use crate::notification::{
+    AgentEventKind, IngressError, Level, NormalizedMetadata, Notification, NotificationDraft,
+    NotificationId, NotificationKey, NotificationUpdate, Placement, Presentation,
+    PresentationOverrides, Priority, Provider, SourceContext, Timeout, TmuxServerId,
+};
 
 pub const PROTOCOL_VERSION: u16 = 1;
 pub const MAX_REQUEST_BYTES: usize = 64 * 1024;
@@ -127,6 +131,337 @@ impl RequestEnvelope {
             token: token.to_owned(),
         })
     }
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ClientRequest {
+    pub version: u16,
+    pub request_id: Uuid,
+    #[serde(flatten)]
+    pub command: ClientCommand,
+}
+
+impl ClientRequest {
+    #[must_use]
+    pub fn new(command: ClientCommand) -> Self {
+        Self {
+            version: PROTOCOL_VERSION,
+            request_id: Uuid::now_v7(),
+            command,
+        }
+    }
+
+    pub fn from_envelope(envelope: &RequestEnvelope) -> Result<Self, ProtocolError> {
+        let request: Self = serde_json::from_value(envelope.value.clone())
+            .map_err(ProtocolError::InvalidPayload)?;
+        if request.version != PROTOCOL_VERSION
+            || request.request_id != envelope.request_id
+            || request.command.kind() != envelope.kind
+        {
+            return Err(ProtocolError::EnvelopeMismatch);
+        }
+        request.command.validate()?;
+        Ok(request)
+    }
+
+    pub fn encode_line(&self) -> Result<Vec<u8>, ProtocolError> {
+        let mut bytes = serde_json::to_vec(self).map_err(ProtocolError::Encode)?;
+        if bytes.len() > MAX_REQUEST_BYTES {
+            return Err(ProtocolError::FrameTooLarge {
+                limit: MAX_REQUEST_BYTES,
+            });
+        }
+        bytes.push(b'\n');
+        Ok(bytes)
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "kebab-case")]
+pub enum ClientCommand {
+    Send {
+        notification: Box<WireNotificationDraft>,
+    },
+    Update {
+        selector: WireSelector,
+        update: WireNotificationUpdate,
+    },
+    Dismiss {
+        selector: WireSelector,
+    },
+    Jump {
+        key: String,
+    },
+    History {
+        include_hidden: bool,
+        all_servers: bool,
+        limit: u32,
+    },
+    HistoryClear {
+        selector: WireHistoryClear,
+        all_servers: bool,
+    },
+}
+
+impl ClientCommand {
+    fn kind(&self) -> RequestKind {
+        match self {
+            Self::Send { .. } => RequestKind::Send,
+            Self::Update { .. } => RequestKind::Update,
+            Self::Dismiss { .. } => RequestKind::Dismiss,
+            Self::Jump { .. } => RequestKind::Jump,
+            Self::History { .. } => RequestKind::History,
+            Self::HistoryClear { .. } => RequestKind::HistoryClear,
+        }
+    }
+
+    fn validate(&self) -> Result<(), ProtocolError> {
+        match self {
+            Self::Send { notification } => notification.as_ref().clone().into_domain().map(|_| ()),
+            Self::Update { selector, update } => {
+                selector.clone().into_domain()?;
+                let update = update.clone().into_domain()?;
+                if update.is_empty() {
+                    return Err(ProtocolError::EmptyUpdate);
+                }
+                Ok(())
+            }
+            Self::Dismiss { selector } => selector.clone().into_domain().map(|_| ()),
+            Self::Jump { key } => NotificationKey::new(key)
+                .map(|_| ())
+                .map_err(ProtocolError::Ingress),
+            Self::History { limit, .. } if *limit == 0 || *limit > 100_000 => {
+                Err(ProtocolError::InvalidHistoryLimit)
+            }
+            Self::History { .. } | Self::HistoryClear { .. } => Ok(()),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct WireNotificationDraft {
+    pub key: Option<String>,
+    pub level: Level,
+    pub priority: Priority,
+    pub presentation: Presentation,
+    pub title: String,
+    pub body: String,
+    pub timeout_ms: Option<u64>,
+    pub source: Option<WireSourceContext>,
+    pub position: Option<Placement>,
+    pub metadata: WireMetadata,
+}
+
+impl WireNotificationDraft {
+    #[must_use]
+    pub fn from_domain(draft: &NotificationDraft) -> Self {
+        Self {
+            key: draft.key().map(|key| key.as_str().to_owned()),
+            level: draft.level(),
+            priority: draft.priority(),
+            presentation: draft.presentation(),
+            title: draft.title().to_owned(),
+            body: draft.body().to_owned(),
+            timeout_ms: timeout_millis(draft.timeout()),
+            source: draft.source().map(WireSourceContext::from_domain),
+            position: draft.overrides().position(),
+            metadata: WireMetadata::from_domain(draft.metadata()),
+        }
+    }
+
+    pub fn into_domain(self) -> Result<NotificationDraft, ProtocolError> {
+        let source = self
+            .source
+            .map(WireSourceContext::into_domain)
+            .transpose()?;
+        let mut draft = NotificationDraft::new(self.presentation, &self.title, &self.body, source)?
+            .with_level(self.level)
+            .with_priority(self.priority)
+            .with_timeout(wire_timeout(self.timeout_ms));
+        if let Some(key) = self.key {
+            draft = draft.with_key(NotificationKey::new(&key)?);
+        }
+        if let Some(position) = self.position {
+            draft = draft.with_overrides(PresentationOverrides::default().with_position(position));
+        }
+        draft = draft.with_metadata(self.metadata.into_domain()?);
+        Ok(draft)
+    }
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct WireNotificationUpdate {
+    pub title: Option<String>,
+    pub body: Option<String>,
+    pub level: Option<Level>,
+    pub priority: Option<Priority>,
+    /// `Some(None)` selects Never; `Some(Some(ms))` selects a finite timeout.
+    pub timeout_ms: Option<Option<u64>>,
+    pub position: Option<Placement>,
+}
+
+impl WireNotificationUpdate {
+    #[must_use]
+    pub fn from_domain(update: &NotificationUpdate) -> Self {
+        Self {
+            title: update.title().map(str::to_owned),
+            body: update.body().map(str::to_owned),
+            level: update.level(),
+            priority: update.priority(),
+            timeout_ms: update.timeout().map(timeout_millis),
+            position: update.overrides().and_then(PresentationOverrides::position),
+        }
+    }
+
+    pub fn into_domain(self) -> Result<NotificationUpdate, ProtocolError> {
+        let mut update = NotificationUpdate::new();
+        if let Some(title) = self.title {
+            update = update.with_title(&title)?;
+        }
+        if let Some(body) = self.body {
+            update = update.with_body(&body)?;
+        }
+        if let Some(level) = self.level {
+            update = update.with_level(level);
+        }
+        if let Some(priority) = self.priority {
+            update = update.with_priority(priority);
+        }
+        if let Some(timeout) = self.timeout_ms {
+            update = update.with_timeout(wire_timeout(timeout));
+        }
+        if let Some(position) = self.position {
+            update =
+                update.with_overrides(PresentationOverrides::default().with_position(position));
+        }
+        Ok(update)
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct WireSourceContext {
+    pub provider: Option<Provider>,
+    pub provider_session_id: Option<String>,
+    pub tmux_server_id: String,
+    pub session_id: String,
+    pub window_id: String,
+    pub pane_id: String,
+    pub cwd: Option<String>,
+    pub command: Option<String>,
+    pub pane_title: Option<String>,
+}
+
+impl WireSourceContext {
+    fn from_domain(source: &SourceContext) -> Self {
+        Self {
+            provider: source.provider(),
+            provider_session_id: source.provider_session_id().map(str::to_owned),
+            tmux_server_id: source.tmux_server_id().as_str().to_owned(),
+            session_id: source.session_id().to_owned(),
+            window_id: source.window_id().to_owned(),
+            pane_id: source.pane_id().to_owned(),
+            cwd: source.cwd().map(|path| path.to_string_lossy().into_owned()),
+            command: source.command().map(str::to_owned),
+            pane_title: source.pane_title().map(str::to_owned),
+        }
+    }
+
+    fn into_domain(self) -> Result<SourceContext, ProtocolError> {
+        let mut source = SourceContext::new(
+            TmuxServerId::new(&self.tmux_server_id)?,
+            &self.session_id,
+            &self.window_id,
+            &self.pane_id,
+        )?;
+        match (self.provider, self.provider_session_id) {
+            (Some(provider), Some(session)) => {
+                source = source.with_provider_session(provider, &session)?;
+            }
+            (None, None) => {}
+            _ => return Err(ProtocolError::IncompleteProviderSource),
+        }
+        if let Some(cwd) = self.cwd {
+            source = source.with_cwd(&cwd)?;
+        }
+        if let Some(command) = self.command {
+            source = source.with_command(&command)?;
+        }
+        if let Some(title) = self.pane_title {
+            source = source.with_pane_title(&title)?;
+        }
+        Ok(source)
+    }
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct WireMetadata {
+    pub agent_event_kind: Option<AgentEventKind>,
+    pub agent_name: Option<String>,
+    pub tool_name: Option<String>,
+}
+
+impl WireMetadata {
+    fn from_domain(metadata: &NormalizedMetadata) -> Self {
+        Self {
+            agent_event_kind: metadata.agent_event_kind(),
+            agent_name: metadata.agent_name().map(str::to_owned),
+            tool_name: metadata.tool_name().map(str::to_owned),
+        }
+    }
+
+    fn into_domain(self) -> Result<NormalizedMetadata, ProtocolError> {
+        let mut metadata = NormalizedMetadata::new(self.agent_event_kind);
+        if let Some(name) = self.agent_name {
+            metadata = metadata.with_agent_name(&name)?;
+        }
+        if let Some(name) = self.tool_name {
+            metadata = metadata.with_tool_name(&name)?;
+        }
+        Ok(metadata)
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct WireSelector {
+    pub id: Option<String>,
+    pub key: Option<String>,
+}
+
+impl WireSelector {
+    pub fn into_domain(self) -> Result<TargetSelector, ProtocolError> {
+        match (self.id, self.key) {
+            (Some(id), None) => Ok(TargetSelector::Id(id.parse()?)),
+            (None, Some(key)) => Ok(TargetSelector::Key(NotificationKey::new(&key)?)),
+            _ => Err(ProtocolError::InvalidSelector),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum TargetSelector {
+    Id(NotificationId),
+    Key(NotificationKey),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WireHistoryClear {
+    Hidden,
+    BeforeMillis(i64),
+    All,
+}
+
+fn timeout_millis(timeout: Timeout) -> Option<u64> {
+    match timeout {
+        Timeout::After(duration) => Some(u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)),
+        Timeout::Never => None,
+    }
+}
+
+fn wire_timeout(milliseconds: Option<u64>) -> Timeout {
+    milliseconds.map_or(Timeout::Never, |value| {
+        Timeout::After(Duration::from_millis(value))
+    })
 }
 
 #[derive(Clone, Eq, PartialEq)]
@@ -523,6 +858,22 @@ pub enum ProtocolError {
     UnsupportedVersion(u64),
     #[error("unknown request type: {0}")]
     UnknownRequestType(String),
+    #[error("request payload is invalid: {0}")]
+    InvalidPayload(serde_json::Error),
+    #[error("failed to encode request: {0}")]
+    Encode(serde_json::Error),
+    #[error("validated envelope and typed request do not match")]
+    EnvelopeMismatch,
+    #[error("selector must contain exactly one of id or key")]
+    InvalidSelector,
+    #[error("update contains no fields")]
+    EmptyUpdate,
+    #[error("History limit must be between 1 and 100000")]
+    InvalidHistoryLimit,
+    #[error("provider and provider_session_id must either both be present or both be absent")]
+    IncompleteProviderSource,
+    #[error("request failed safe ingress validation: {0}")]
+    Ingress(#[from] IngressError),
     #[error("request type is not renderer-redeem")]
     UnexpectedRequestType,
 }
@@ -791,6 +1142,118 @@ mod tests {
         assert!(matches!(
             malformed.renderer_redemption(),
             Err(ProtocolError::MissingOrInvalidField("token"))
+        ));
+    }
+
+    #[test]
+    fn typed_send_round_trips_through_the_validated_domain_boundary() {
+        let source = SourceContext::new(TmuxServerId::new("server").unwrap(), "$1", "@2", "%3")
+            .unwrap()
+            .with_provider_session(Provider::Codex, "thread-1")
+            .unwrap()
+            .with_cwd("/work")
+            .unwrap();
+        let draft =
+            NotificationDraft::new(Presentation::Toast, "Codex", "done\u{1b}[31m", Some(source))
+                .unwrap()
+                .with_key(NotificationKey::new("codex:thread-1:completed").unwrap())
+                .with_level(Level::Success)
+                .with_priority(Priority::High)
+                .with_timeout(Timeout::Never)
+                .with_overrides(
+                    PresentationOverrides::default().with_position(Placement::BottomRight),
+                )
+                .with_metadata(
+                    NormalizedMetadata::new(Some(AgentEventKind::Completed))
+                        .with_agent_name("worker")
+                        .unwrap(),
+                );
+        let request = ClientRequest::new(ClientCommand::Send {
+            notification: Box::new(WireNotificationDraft::from_domain(&draft)),
+        });
+        let encoded = request.encode_line().unwrap();
+        assert!(!String::from_utf8_lossy(&encoded).contains("\u{1b}"));
+        let envelope = RequestEnvelope::decode(&encoded[..encoded.len() - 1]).unwrap();
+        let decoded = ClientRequest::from_envelope(&envelope).unwrap();
+        let ClientCommand::Send { notification } = decoded.command else {
+            panic!("expected send");
+        };
+        assert_eq!((*notification).into_domain().unwrap(), draft);
+    }
+
+    #[test]
+    fn typed_update_and_selectors_reject_empty_or_ambiguous_requests() {
+        let id = NotificationId::new();
+        let update = NotificationUpdate::new()
+            .with_body("done")
+            .unwrap()
+            .with_timeout(Timeout::After(Duration::from_secs(2)));
+        let request = ClientRequest::new(ClientCommand::Update {
+            selector: WireSelector {
+                id: Some(id.to_string()),
+                key: None,
+            },
+            update: WireNotificationUpdate::from_domain(&update),
+        });
+        let line = request.encode_line().unwrap();
+        let envelope = RequestEnvelope::decode(&line[..line.len() - 1]).unwrap();
+        assert!(ClientRequest::from_envelope(&envelope).is_ok());
+
+        let empty = ClientRequest::new(ClientCommand::Update {
+            selector: WireSelector {
+                id: None,
+                key: Some("build".into()),
+            },
+            update: WireNotificationUpdate::default(),
+        });
+        let line = empty.encode_line().unwrap();
+        let envelope = RequestEnvelope::decode(&line[..line.len() - 1]).unwrap();
+        assert!(matches!(
+            ClientRequest::from_envelope(&envelope),
+            Err(ProtocolError::EmptyUpdate)
+        ));
+
+        assert!(matches!(
+            WireSelector {
+                id: Some(id.to_string()),
+                key: Some("build".into()),
+            }
+            .into_domain(),
+            Err(ProtocolError::InvalidSelector)
+        ));
+    }
+
+    #[test]
+    fn typed_attention_revalidates_source_and_history_limits() {
+        let attention = WireNotificationDraft {
+            key: Some("attention".into()),
+            level: Level::Warning,
+            priority: Priority::High,
+            presentation: Presentation::Attention,
+            title: "input".into(),
+            body: "needed".into(),
+            timeout_ms: None,
+            source: None,
+            position: None,
+            metadata: WireMetadata::default(),
+        };
+        assert!(matches!(
+            attention.into_domain(),
+            Err(ProtocolError::Ingress(
+                IngressError::AttentionRequiresSource
+            ))
+        ));
+
+        let history = ClientRequest::new(ClientCommand::History {
+            include_hidden: false,
+            all_servers: false,
+            limit: 0,
+        });
+        let line = history.encode_line().unwrap();
+        let envelope = RequestEnvelope::decode(&line[..line.len() - 1]).unwrap();
+        assert!(matches!(
+            ClientRequest::from_envelope(&envelope),
+            Err(ProtocolError::InvalidHistoryLimit)
         ));
     }
 }
