@@ -7,6 +7,7 @@
 
 mod reconcile;
 mod service;
+pub mod runtime;
 
 pub use reconcile::{
     ReconcileError, ReconcileOutcome, ReconcileStatus, WindowDisplayPolicy, WindowReconciler,
