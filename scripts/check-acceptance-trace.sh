@@ -48,6 +48,8 @@ RELIABILITY-ARGV|render::tests::token_is_cryptographic_length_and_debug_is_redac
 RELIABILITY-RENDER|daemon::reconcile::tests::partial_success_retries_only_after_backoff_and_all_exhaustion_closes
 RELIABILITY-SQLITE|history::tests::busy_retries_are_bounded
 RELIABILITY-DAEMON|daemon::tests::render_and_daemon_boundaries_record_explicit_close_reasons
+RELIABILITY-BACKPRESSURE|daemon::runtime::tests::per_connection_limit_backpressures_without_aborting_accepted_requests
+RELIABILITY-FORCED-SHUTDOWN|daemon::runtime::tests::renderer_aware_server_honors_forced_shutdown_during_cleanup
 RELIABILITY-DOCTOR|doctor::tests::system_probe_is_read_only_and_runs_without_tmux_or_daemon
 TRACE
 

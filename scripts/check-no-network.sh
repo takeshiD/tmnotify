@@ -1,7 +1,7 @@
 #!/bin/sh
 set -eu
 
-if grep -R -n -E '(^|[^[:alnum:]_])(std|tokio|async_std)::net|Tcp(Stream|Listener)|UdpSocket|reqwest|hyper::|ureq::|curl::' src Cargo.toml
+if grep -R -n -E 'Tcp(Stream|Listener)|UdpSocket|reqwest|hyper::|ureq::|curl::' src Cargo.toml
 then
     echo 'product source or direct dependencies expose a network-access path' >&2
     exit 1

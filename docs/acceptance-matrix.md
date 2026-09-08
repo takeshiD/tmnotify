@@ -55,9 +55,9 @@ run only against a temporary -S socket with -f /dev/null.
 |---|---|---|
 | Startup races select one owner; retries are idempotent | RELIABILITY-RACE; TMUX-RACE | RS-01 |
 | Stale sockets recover only after ownership/type checks | RELIABILITY-STALE | RS-10 |
-| Malformed and oversized requests remain bounded | RELIABILITY-INPUT plus notification size tests | - |
+| Malformed and oversized requests remain bounded | RELIABILITY-INPUT, RELIABILITY-BACKPRESSURE plus notification size tests | - |
 | Content cannot inject controls or enter argv/logs | RELIABILITY-CONTENT, RELIABILITY-ARGV plus private logger tests | - |
-| Control, renderer, SQLite, daemon, and tmux failures terminate boundedly | RELIABILITY-RENDER, RELIABILITY-SQLITE, RELIABILITY-DAEMON; TMUX-RECONNECT, TMUX-SHUTDOWN | RS-10 |
+| Control, renderer, SQLite, daemon, and tmux failures terminate boundedly | RELIABILITY-RENDER, RELIABILITY-SQLITE, RELIABILITY-DAEMON, RELIABILITY-FORCED-SHUTDOWN; TMUX-RECONNECT, TMUX-SHUTDOWN | RS-10 |
 | Doctor is actionable and read-only | RELIABILITY-DOCTOR | RS-10 |
 
 ## Isolated tmux check IDs
