@@ -45,8 +45,8 @@ jobs:
           fi
       - name: Build release binary
         run: cargo build --locked --release --target "${{ matrix.target }}"
-      - name: Smoke-test version
-        run: "target/${{ matrix.target }}/release/tmnotify --version"
+      - name: Smoke-test release command surface
+        run: scripts/smoke-release.sh "target/${{ matrix.target }}/release/tmnotify"
       - name: Package reproducibly
         run: |
           version=$(sed -n 's/^version = "\([^"]*\)"$/\1/p' Cargo.toml | head -n 1)
@@ -66,7 +66,7 @@ jobs:
           version=$(sed -n 's/^version = "\([^"]*\)"$/\1/p' Cargo.toml | head -n 1)
           mkdir "$RUNNER_TEMP/smoke"
           tar -xzf "dist/tmnotify-$version-${{ matrix.target }}.tar.gz" -C "$RUNNER_TEMP/smoke"
-          "$RUNNER_TEMP/smoke/tmnotify-$version-${{ matrix.target }}/tmnotify" --version
+          scripts/smoke-release.sh "$RUNNER_TEMP/smoke/tmnotify-$version-${{ matrix.target }}/tmnotify"
       - name: Upload verified artifact
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:

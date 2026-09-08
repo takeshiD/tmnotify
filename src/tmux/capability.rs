@@ -18,6 +18,7 @@ const REQUIRED_FORMATS: &[&str] = &[
     "pane_height",
     "pane_id",
     "pane_left",
+    "pane_modal_flag",
     "pane_top",
     "pane_width",
     "session_id",
@@ -31,6 +32,7 @@ pub enum Capability {
     FloatingPaneCreation,
     FloatingPaneMovement,
     FloatingPaneResize,
+    ModalPaneCreation,
     StableIdsAndTopologyFormats,
     ControlClientIdentification,
 }
@@ -65,6 +67,7 @@ impl CapabilityReport {
             Capability::FloatingPaneCreation,
             Capability::FloatingPaneMovement,
             Capability::FloatingPaneResize,
+            Capability::ModalPaneCreation,
             Capability::StableIdsAndTopologyFormats,
             Capability::ControlClientIdentification,
         ]
@@ -270,6 +273,13 @@ pub(super) fn evaluate_observed(
         "resize-pane",
         "txy",
     );
+    check_flags(
+        &mut report,
+        &command_flags,
+        Capability::ModalPaneCreation,
+        "new-pane",
+        "OtxyXY",
+    );
     check(
         &mut report,
         Capability::StableIdsAndTopologyFormats,
@@ -350,7 +360,7 @@ fn parse_format_names(formats: &str) -> BTreeSet<&str> {
 mod tests {
     use super::*;
 
-    const COMMANDS: &str = "break-pane (breakp) [-abdPW] [-F format] [-s src-pane] [-t dst-window] [-x width] [-y height] [-X x-position] [-Y y-position]\nmove-pane (movep) [-bdfhMv] [-D lines] [-L columns] [-R columns] [-t dst-pane] [-U lines] [-X x-position] [-Y y-position] [-z z-index]\nresize-pane (resizep) [-MTZ] [-x width] [-y height] [-t target-pane]\n";
+    const COMMANDS: &str = "break-pane (breakp) [-abdPW] [-F format] [-s src-pane] [-t dst-window] [-x width] [-y height] [-X x-position] [-Y y-position]\nmove-pane (movep) [-bdfhMv] [-D lines] [-L columns] [-R columns] [-t dst-pane] [-U lines] [-X x-position] [-Y y-position] [-z z-index]\nnew-pane (newp) [-AbCdefhIkKLMOPvWZ] [-t target-pane] [-x width] [-y height] [-X x-position] [-Y y-position]\nresize-pane (resizep) [-MTZ] [-x width] [-y height] [-t target-pane]\n";
 
     fn formats() -> String {
         REQUIRED_FORMATS
@@ -378,7 +388,7 @@ mod tests {
         );
         let error = report.require_display_service().unwrap_err();
 
-        assert_eq!(error.missing.len(), 6);
+        assert_eq!(error.missing.len(), 7);
         assert!(error.missing.contains_key(&Capability::ControlMode));
         assert!(
             error
@@ -392,6 +402,7 @@ mod tests {
         let flags = parse_command_flags(COMMANDS);
         assert!(flags["break-pane"].is_superset(&['W', 'x', 'y', 'X', 'Y'].into()));
         assert!(flags["move-pane"].is_superset(&['D', 'L', 'R', 'U', 'z'].into()));
+        assert!(flags["new-pane"].is_superset(&['O', 'x', 'y', 'X', 'Y'].into()));
     }
 
     #[test]

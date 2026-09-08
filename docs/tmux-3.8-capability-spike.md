@@ -4,6 +4,13 @@ Issue #4 was verified on 2026-09-08 against `tmux next-3.8`. Every runtime
 probe used a dedicated `-S /tmp/tmnotify-issue4-*.sock` server created with
 `-f /dev/null`; the user's default server was never contacted.
 
+Issue #21 repeated the isolated runtime probe and corrected two assumptions in
+the original script: `break-pane -W` floats a pane in its existing window,
+and requested floating dimensions include the border. The required pinned gate
+now uses upstream commit
+`d44bfda26d2468b5f474087b56f93eda34c541b6`, which also includes the modal
+pane surface added after the previous July 2 pin.
+
 ## Confirmed capability surface
 
 tmnotify gates display service on observed commands, flags, formats, and a real
@@ -11,9 +18,10 @@ short-lived control-mode handshake, not on the version string.
 
 | Need | Confirmed surface |
 |---|---|
-| Floating pane creation | Create a normal pane, then `break-pane -W -s %N -t @N -X x -Y y -x width -y height -d`. `pane_floating_flag=1` confirms the result. |
+| Floating pane creation | Create a tiled pane in the intended Attention Window, then `break-pane -W -s %N -X x -Y y -x width -y height -d`. `pane_floating_flag=1` confirms the result. In the `-W` branch, `break-pane` floats the Source Pane in its existing window; `-t` does not move it to another window. |
+| Modal pane creation | `new-pane -O -t %N -X x -Y y -x width -y height` creates the Attention surface. Both `pane_floating_flag=1` and `pane_modal_flag=1` are required, and the modal pane becomes active. |
 | Movement | `move-pane -t %N -L/-R/-U/-D cells`; `-z` changes stacking order. Absolute `-X/-Y` flags exist, but the relative flags were observed changing `pane_left`/`pane_top` and are the dependable reconciliation primitive. |
-| Resize | `resize-pane -t %N -x width -y height`. For a floating pane, the reported content size excludes its border (a requested 32x9 produced `pane_width=30`, `pane_height=7`). Reconciliation must compare like-for-like geometry. |
+| Resize | `resize-pane -t %N -x width -y height`. For a bordered floating pane, the reported content size excludes its border: a requested 32x9 produces 30x7 content cells, and resizing to 30x7 produces 28x5. Reconciliation must compare like-for-like geometry. |
 | Stable identity | `$N`, `@N`, and `%N` are available as `session_id`, `window_id`, and `pane_id`. Names and indexes are not required for identity. |
 | Topology/client formats | `client_name`, `client_control_mode`, `client_activity`, stable `session_id`/`window_id`, `socket_path`, floating flag, and pane geometry fields are present. `client_session` is a name and is deliberately not used as identity. |
 | Infrastructure exclusion | The attached `-C` client reported `client_control_mode=1`; recipient derivation can exclude it without relying on its generated name. |
@@ -46,6 +54,9 @@ the isolated 3.8 run and contains no user pane content.
 
 - tmux's floating-pane work is on the `next-3.8` surface. Before release, repeat
   this probe against the final 3.8 release on Linux and macOS.
+- `break-pane -W` requires the renderer pane to be created in the destination
+  window first. Treating `-t` as a cross-window destination silently probes the
+  wrong window because the floating branch does not use it.
 - Floating dimensions distinguish requested outer geometry from reported inner
   pane geometry. The renderer/display implementation must centralize that
   border conversion and test the six placements at narrow sizes.

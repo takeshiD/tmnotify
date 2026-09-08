@@ -27,13 +27,19 @@ jobs:
           sh autogen.sh
           ./configure --prefix="$RUNNER_TEMP/tmux-install"
           make -j2 install
-      - name: Probe only an isolated tmux server
+      - name: Exercise isolated tmux capabilities and lifecycle
+        env:
+          TMNOTIFY_TMUX_ARTIFACT_DIR: ${{ runner.temp }}/tmux-acceptance
         run: scripts/test-tmux-capabilities.sh "$RUNNER_TEMP/tmux-install/bin/tmux"
-      - name: Run deterministic tmux module tests
+      - name: Verify tmux-facing product policy
         run: |
           cargo test --locked tmux::capability
           cargo test --locked tmux::control
           cargo test --locked tmux::topology
+          cargo test --locked daemon::reconcile::tests
+          cargo test --locked toast::tests::order_capacity_and_waiting_are_per_window
+          cargo test --locked toast::tests::animation_batches_windows_and_drops_quantized_duplicates
+          cargo test --locked daemon::tests::attention_is_global_and_queued_by_priority_fifo
       - name: Run isolated ProductionBackend integration tests
         run: |
           PATH="$RUNNER_TEMP/tmux-install/bin:$PATH" \
@@ -41,3 +47,13 @@ jobs:
       - name: Report resolved upstream commit
         if: always()
         run: cat "$RUNNER_TEMP/tmux-master-commit"
+      - name: Upload isolated tmux diagnostics
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: tmux-master-acceptance
+          path: |
+            ${{ runner.temp }}/tmux-master-commit
+            ${{ runner.temp }}/tmux-acceptance
+          if-no-files-found: error
+          retention-days: 7

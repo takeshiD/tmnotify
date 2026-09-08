@@ -68,6 +68,7 @@ for file in README.md LICENSE-MIT LICENSE-APACHE CONTEXT.md tmnotify-design.md; 
     install -m 0644 "$repository_root/$file" "$package_root/$file"
 done
 install -m 0644 "$repository_root/docs/release.md" "$package_root/docs/release.md"
+install -m 0644 "$repository_root/docs/acceptance-matrix.md" "$package_root/docs/acceptance-matrix.md"
 for file in "$repository_root"/docs/adr/*.md; do
     install -m 0644 "$file" "$package_root/docs/adr/$(basename -- "$file")"
 done
