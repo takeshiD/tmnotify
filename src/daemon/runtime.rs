@@ -367,7 +367,16 @@ where
     C: FnOnce(RuntimeShutdown) -> CF,
     CF: Future<Output = ()>,
 {
-    serve_inner(owned, limits, handler, None, shutdown, cleanup).await
+    serve_inner(
+        owned,
+        limits,
+        handler,
+        None,
+        shutdown,
+        std::future::pending(),
+        cleanup,
+    )
+    .await
 }
 
 /// Variant used by the daemon display service. Renderer redemption takes over
@@ -393,23 +402,87 @@ where
         handler,
         Some(renderer_broker),
         shutdown,
+        std::future::pending(),
         cleanup,
     )
     .await
 }
 
-async fn serve_inner<H, HF, S, C, CF>(
+/// Renderer-aware variant with the same immediate second-interrupt escape
+/// hatch as [`serve_with_force_shutdown`].
+pub async fn serve_with_renderers_and_force_shutdown<H, HF, S, F, C, CF>(
     owned: OwnedSocket,
     limits: RuntimeLimits,
     handler: H,
-    renderer_broker: Option<Arc<dyn RendererBroker>>,
+    renderer_broker: Arc<dyn RendererBroker>,
     shutdown: S,
+    force_shutdown: F,
     cleanup: C,
 ) -> Result<RuntimeShutdown, RuntimeError>
 where
     H: Fn(RequestEnvelope) -> HF + Clone + Send + Sync + 'static,
     HF: Future<Output = Result<Value, String>> + Send + 'static,
     S: Future<Output = RuntimeShutdown> + Send,
+    F: Future<Output = ()> + Send,
+    C: FnOnce(RuntimeShutdown) -> CF,
+    CF: Future<Output = ()>,
+{
+    serve_inner(
+        owned,
+        limits,
+        handler,
+        Some(renderer_broker),
+        shutdown,
+        force_shutdown,
+        cleanup,
+    )
+    .await
+}
+
+/// Serve like [`serve`], but abandon connection draining and cleanup as soon
+/// as `force_shutdown` resolves.
+pub async fn serve_with_force_shutdown<H, HF, S, F, C, CF>(
+    owned: OwnedSocket,
+    limits: RuntimeLimits,
+    handler: H,
+    shutdown: S,
+    force_shutdown: F,
+    cleanup: C,
+) -> Result<RuntimeShutdown, RuntimeError>
+where
+    H: Fn(RequestEnvelope) -> HF + Clone + Send + Sync + 'static,
+    HF: Future<Output = Result<Value, String>> + Send + 'static,
+    S: Future<Output = RuntimeShutdown> + Send,
+    F: Future<Output = ()> + Send,
+    C: FnOnce(RuntimeShutdown) -> CF,
+    CF: Future<Output = ()>,
+{
+    serve_inner(
+        owned,
+        limits,
+        handler,
+        None,
+        shutdown,
+        force_shutdown,
+        cleanup,
+    )
+    .await
+}
+
+async fn serve_inner<H, HF, S, F, C, CF>(
+    owned: OwnedSocket,
+    limits: RuntimeLimits,
+    handler: H,
+    renderer_broker: Option<Arc<dyn RendererBroker>>,
+    shutdown: S,
+    force_shutdown: F,
+    cleanup: C,
+) -> Result<RuntimeShutdown, RuntimeError>
+where
+    H: Fn(RequestEnvelope) -> HF + Clone + Send + Sync + 'static,
+    HF: Future<Output = Result<Value, String>> + Send + 'static,
+    S: Future<Output = RuntimeShutdown> + Send,
+    F: Future<Output = ()> + Send,
     C: FnOnce(RuntimeShutdown) -> CF,
     CF: Future<Output = ()>,
 {
@@ -425,9 +498,12 @@ where
     let mut tasks = JoinSet::new();
     let (stop_connections, stop_rx) = watch::channel(false);
     tokio::pin!(shutdown);
+    tokio::pin!(force_shutdown);
 
     let reason = loop {
         tokio::select! {
+            biased;
+            _ = &mut force_shutdown => return Err(RuntimeError::ForcedShutdown),
             reason = &mut shutdown => break reason,
             accepted = owned.listener.accept() => {
                 let (stream, _) = accepted.map_err(|source| RuntimeError::Io { path: owned.path.clone(), source })?;
@@ -458,18 +534,27 @@ where
         .max(Duration::from_nanos(1))
         .min(limits.shutdown_timeout);
     let cleanup_budget = limits.shutdown_timeout.saturating_sub(connection_budget);
-    let connections_timed_out = timeout(connection_budget, async {
-        while tasks.join_next().await.is_some() {}
-    })
-    .await
-    .is_err();
+    let connections_timed_out = tokio::select! {
+        biased;
+        _ = &mut force_shutdown => {
+            tasks.abort_all();
+            return Err(RuntimeError::ForcedShutdown);
+        }
+        result = timeout(connection_budget, async {
+            while tasks.join_next().await.is_some() {}
+        }) => result.is_err(),
+    };
     if connections_timed_out {
         tasks.abort_all();
         while tasks.join_next().await.is_some() {}
     }
-    timeout(cleanup_budget, cleanup(reason))
-        .await
-        .map_err(|_| RuntimeError::ShutdownTimedOut)?;
+    tokio::select! {
+        biased;
+        _ = &mut force_shutdown => return Err(RuntimeError::ForcedShutdown),
+        result = timeout(cleanup_budget, cleanup(reason)) => {
+            result.map_err(|_| RuntimeError::ShutdownTimedOut)?;
+        }
+    }
     drop(owned);
     if connections_timed_out {
         return Err(RuntimeError::ShutdownTimedOut);
@@ -566,11 +651,27 @@ async fn connection_loop<H, HF>(
                 return;
             }
             first_frame = false;
-            let Ok(local) = per_connection.clone().try_acquire_owned() else {
-                return;
+            let local = tokio::select! {
+                biased;
+                changed = shutdown.changed() => {
+                    let _ = changed;
+                    return;
+                }
+                permit = per_connection.clone().acquire_owned() => {
+                    let Ok(permit) = permit else { return };
+                    permit
+                }
             };
-            let Ok(global) = inflight.clone().try_acquire_owned() else {
-                return;
+            let global = tokio::select! {
+                biased;
+                changed = shutdown.changed() => {
+                    let _ = changed;
+                    return;
+                }
+                permit = inflight.clone().acquire_owned() => {
+                    let Ok(permit) = permit else { return };
+                    permit
+                }
             };
             let writer = writer.clone();
             let cache = cache.clone();
@@ -819,6 +920,8 @@ pub enum RuntimeError {
     StartupTimedOut,
     #[error("daemon cleanup exceeded two seconds")]
     ShutdownTimedOut,
+    #[error("second interrupt forced immediate daemon exit")]
+    ForcedShutdown,
     #[error("daemon response timed out")]
     ResponseTimedOut,
     #[error("daemon closed the connection without a response")]
@@ -1007,6 +1110,15 @@ mod tests {
             self.0.lock().unwrap().push((window_display_id, action));
             Box::pin(async { Ok(()) })
         }
+    }
+
+    fn empty_renderer_broker() -> Arc<dyn RendererBroker> {
+        Arc::new(SessionRendererBroker::new(
+            Arc::new(StdMutex::new(
+                RendererSessions::new(SessionLimits::default()).unwrap(),
+            )),
+            Arc::new(FakeActions::default()),
+        ))
     }
 
     fn renderer_content() -> RendererContent {
@@ -1267,6 +1379,77 @@ mod tests {
         assert_eq!(server.await.unwrap().unwrap(), RuntimeShutdown::Signal);
     }
 
+    #[tokio::test]
+    async fn per_connection_limit_backpressures_without_aborting_accepted_requests() {
+        let temp = private_dir();
+        let path = temp.path().join("daemon.sock");
+        let owner = OwnedSocket::bind(&path).unwrap();
+        let (stop_tx, stop_rx) = oneshot::channel();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let started = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        let observed_calls = Arc::clone(&calls);
+        let observed_started = Arc::clone(&started);
+        let observed_release = Arc::clone(&release);
+        let server = tokio::spawn(serve_with_renderers(
+            owner,
+            RuntimeLimits {
+                max_inflight_per_connection: 1,
+                ..RuntimeLimits::default()
+            },
+            move |_| {
+                let call = observed_calls.fetch_add(1, Ordering::SeqCst);
+                let started = Arc::clone(&observed_started);
+                let release = Arc::clone(&observed_release);
+                async move {
+                    if call == 0 {
+                        started.notify_one();
+                        release.notified().await;
+                    }
+                    Ok(json!({"accepted": true}))
+                }
+            },
+            empty_renderer_broker(),
+            async { stop_rx.await.unwrap() },
+            |_| async {},
+        ));
+
+        let first =
+            serde_json::to_vec(&json!({"version":1,"request_id":Uuid::now_v7(),"type":"history"}))
+                .unwrap();
+        let second =
+            serde_json::to_vec(&json!({"version":1,"request_id":Uuid::now_v7(),"type":"history"}))
+                .unwrap();
+        let mut stream = UnixStream::connect(&path).await.unwrap();
+        stream.write_all(&first).await.unwrap();
+        stream.write_all(b"\n").await.unwrap();
+        stream.write_all(&second).await.unwrap();
+        stream.write_all(b"\n").await.unwrap();
+        timeout(Duration::from_secs(1), started.notified())
+            .await
+            .unwrap();
+        release.notify_one();
+
+        let mut decoder = FrameDecoder::default();
+        let mut responses = Vec::new();
+        while responses.len() < 2 {
+            let mut chunk = [0_u8; 1024];
+            let read = timeout(Duration::from_secs(1), stream.read(&mut chunk))
+                .await
+                .unwrap()
+                .unwrap();
+            assert_ne!(
+                read, 0,
+                "connection closed before accepted requests replied"
+            );
+            responses.extend(decoder.push(&chunk[..read]).unwrap());
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+
+        stop_tx.send(RuntimeShutdown::Signal).unwrap();
+        assert_eq!(server.await.unwrap().unwrap(), RuntimeShutdown::Signal);
+    }
+
     struct ActiveRequest(Arc<AtomicUsize>);
 
     impl Drop for ActiveRequest {
@@ -1328,6 +1511,85 @@ mod tests {
         ));
         assert_eq!(active.load(Ordering::SeqCst), 0);
         assert_eq!(cleaned.load(Ordering::SeqCst), 1);
+        assert!(!path.exists());
+    }
+
+    #[tokio::test]
+    async fn second_interrupt_abandons_stuck_cleanup_immediately() {
+        let temp = private_dir();
+        let path = temp.path().join("daemon.sock");
+        let owner = OwnedSocket::bind(&path).unwrap();
+        let (stop_tx, stop_rx) = oneshot::channel();
+        let (force_tx, force_rx) = oneshot::channel();
+        let cleanup_started = Arc::new(Notify::new());
+        let observed_cleanup = Arc::clone(&cleanup_started);
+        let server = tokio::spawn(serve_with_force_shutdown(
+            owner,
+            RuntimeLimits::default(),
+            |_| async { Ok(json!({"accepted": true})) },
+            async { stop_rx.await.unwrap() },
+            async {
+                let _ = force_rx.await;
+            },
+            move |_| async move {
+                observed_cleanup.notify_one();
+                pending::<()>().await;
+            },
+        ));
+
+        stop_tx.send(RuntimeShutdown::Signal).unwrap();
+        timeout(Duration::from_secs(1), cleanup_started.notified())
+            .await
+            .unwrap();
+        let forced_at = Instant::now();
+        force_tx.send(()).unwrap();
+        assert!(matches!(
+            timeout(Duration::from_millis(100), server)
+                .await
+                .unwrap()
+                .unwrap(),
+            Err(RuntimeError::ForcedShutdown)
+        ));
+        assert!(forced_at.elapsed() < Duration::from_millis(100));
+        assert!(!path.exists());
+    }
+
+    #[tokio::test]
+    async fn renderer_aware_server_honors_forced_shutdown_during_cleanup() {
+        let temp = private_dir();
+        let path = temp.path().join("daemon.sock");
+        let owner = OwnedSocket::bind(&path).unwrap();
+        let (stop_tx, stop_rx) = oneshot::channel();
+        let (force_tx, force_rx) = oneshot::channel();
+        let cleanup_started = Arc::new(Notify::new());
+        let observed_cleanup = Arc::clone(&cleanup_started);
+        let server = tokio::spawn(serve_with_renderers_and_force_shutdown(
+            owner,
+            RuntimeLimits::default(),
+            |_| async { Ok(json!({"accepted": true})) },
+            empty_renderer_broker(),
+            async { stop_rx.await.unwrap() },
+            async {
+                let _ = force_rx.await;
+            },
+            move |_| async move {
+                observed_cleanup.notify_one();
+                pending::<()>().await;
+            },
+        ));
+
+        stop_tx.send(RuntimeShutdown::Signal).unwrap();
+        timeout(Duration::from_secs(1), cleanup_started.notified())
+            .await
+            .unwrap();
+        force_tx.send(()).unwrap();
+        assert!(matches!(
+            timeout(Duration::from_millis(100), server)
+                .await
+                .unwrap()
+                .unwrap(),
+            Err(RuntimeError::ForcedShutdown)
+        ));
         assert!(!path.exists());
     }
 

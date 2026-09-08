@@ -10,7 +10,7 @@ use std::time::{Duration, Instant};
 use chrono::Utc;
 use serde_json::Value;
 use thiserror::Error;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, oneshot};
 
 use crate::cli::{
     ClearArgs, Cli, Command, DoctorArgs, HistoryAction, HistoryArgs, HookAction, HookArgs,
@@ -20,7 +20,7 @@ use crate::cli::{
 use crate::config::{Config, ConfigOverrides, FeatureMode, HooksConfig, TimeoutValue, load};
 use crate::daemon::runtime::{
     OwnedSocket, RuntimeError, RuntimeLimits, RuntimeShutdown, ServerIdentity,
-    SessionRendererBroker, serve_with_renderers, submit_lazy,
+    SessionRendererBroker, serve_with_renderers_and_force_shutdown, submit_lazy,
 };
 use crate::daemon::{
     DaemonService, JumpExecutor, LiveScheduler, MonotonicTime, SchedulerLimits, ShutdownReason,
@@ -804,12 +804,14 @@ async fn run_daemon(
     let cleanup_backend = Arc::clone(&backend);
     let cleanup_history = Arc::clone(&history);
     let cleanup_stopping = Arc::clone(&stopping);
-    let result = serve_with_renderers(
+    let (shutdown, force_shutdown) = shutdown_signals(shutdown_path);
+    let result = serve_with_renderers_and_force_shutdown(
         owned,
         RuntimeLimits::default(),
         handler,
         renderer_broker,
-        shutdown_signal(shutdown_path),
+        shutdown,
+        force_shutdown,
         move |reason| async move {
             cleanup_stopping.store(true, Ordering::Release);
             let reason = match reason {
@@ -880,20 +882,65 @@ fn monotonic(origin: Instant) -> MonotonicTime {
     MonotonicTime::from_duration(origin.elapsed())
 }
 
-async fn shutdown_signal(tmux_socket: PathBuf) -> RuntimeShutdown {
-    let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-        .expect("SIGTERM handler installation failed");
-    loop {
-        tokio::select! {
-            _ = tokio::signal::ctrl_c() => return RuntimeShutdown::Signal,
-            _ = terminate.recv() => return RuntimeShutdown::Signal,
-            _ = tokio::time::sleep(Duration::from_millis(500)) => {
-                if std::fs::symlink_metadata(&tmux_socket).is_err() {
-                    return RuntimeShutdown::ServerEnded;
+fn shutdown_signals(
+    tmux_socket: PathBuf,
+) -> (
+    impl std::future::Future<Output = RuntimeShutdown>,
+    impl std::future::Future<Output = ()>,
+) {
+    let (graceful_tx, graceful_rx) = oneshot::channel();
+    let (forced_tx, forced_rx) = oneshot::channel();
+    tokio::spawn(async move {
+        let mut graceful_tx = Some(graceful_tx);
+        let mut forced_tx = Some(forced_tx);
+        let mut interrupt_count = 0_u8;
+        let mut terminate =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+                .expect("SIGTERM handler installation failed");
+        loop {
+            tokio::select! {
+                interrupt = tokio::signal::ctrl_c() => {
+                    if interrupt.is_err() {
+                        break;
+                    }
+                    interrupt_count = interrupt_count.saturating_add(1);
+                    if interrupt_count == 1 {
+                        if let Some(sender) = graceful_tx.take() {
+                            let _ = sender.send(RuntimeShutdown::Signal);
+                        }
+                    } else {
+                        if let Some(sender) = forced_tx.take() {
+                            let _ = sender.send(());
+                        }
+                        break;
+                    }
+                }
+                signal = terminate.recv() => {
+                    if signal.is_none() {
+                        break;
+                    }
+                    if let Some(sender) = graceful_tx.take() {
+                        let _ = sender.send(RuntimeShutdown::Signal);
+                    }
+                }
+                _ = tokio::time::sleep(Duration::from_millis(500)), if graceful_tx.is_some() => {
+                    if std::fs::symlink_metadata(&tmux_socket).is_err()
+                        && let Some(sender) = graceful_tx.take()
+                    {
+                        let _ = sender.send(RuntimeShutdown::ServerEnded);
+                    }
                 }
             }
         }
-    }
+    });
+    (
+        async move { graceful_rx.await.unwrap_or(RuntimeShutdown::Signal) },
+        async move {
+            if forced_rx.await.is_err() {
+                std::future::pending::<()>().await;
+            }
+        },
+    )
 }
 
 struct RuntimeHookSubmitter {
