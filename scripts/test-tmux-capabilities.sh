@@ -27,7 +27,7 @@ run_tmux() {
     "$tmux_binary" -S "$socket" -f /dev/null "$@"
 }
 
-run_tmux new-session -d -s tmnotify-ci
+run_tmux new-session -d -s tmnotify-ci 'sleep 30'
 mkfifo "$control_input"
 exec 3<>"$control_input"
 "$tmux_binary" -S "$socket" -f /dev/null -C attach-session -t tmnotify-ci < "$control_input" > "$control_output" 2>&1 &
@@ -61,12 +61,12 @@ for requirement in client_activity client_control_mode client_name pane_floating
 done
 
 target_window=$(run_tmux display-message -p -t tmnotify-ci:0 '#{window_id}')
-run_tmux new-window -d -t tmnotify-ci -n source
+run_tmux new-window -d -t tmnotify-ci -n source 'sleep 30'
 source_pane=$(run_tmux display-message -p -t tmnotify-ci:source '#{pane_id}')
 run_tmux break-pane -W -d -s "$source_pane" -t "$target_window" -X 1 -Y 1 -x 32 -y 9
 
 # A -W floating pane retains its owning window ID while being projected into
-# the destination window, so inspect the whole isolated server.
+# the destination window, so use the all-panes surface used by the daemon.
 pane_snapshot=$(run_tmux list-panes -a -F '#{pane_id} #{pane_floating_flag}')
 floating_pane=$(printf '%s\n' "$pane_snapshot" | awk '$2 == 1 { print $1; exit }')
 [ -n "$floating_pane" ] || {

@@ -23,6 +23,9 @@ use super::{
 pub const DEFAULT_TOPOLOGY_REFRESH_INTERVAL: Duration = Duration::from_secs(5);
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(2);
 const MAX_CONTROL_LINE_BYTES: usize = 256 * 1024;
+const CONTROL_LINE_CHANNEL_CAPACITY: usize = 256;
+const CONTROL_CHILD_SHUTDOWN_WAIT: Duration = Duration::from_millis(100);
+const CONTROL_CHILD_STATUS_POLL: Duration = Duration::from_millis(5);
 
 /// The production tmux boundary for one daemon.
 ///
@@ -290,7 +293,7 @@ impl ProductionBackend {
         if actual.geometry.width != desired.geometry.width
             || actual.geometry.height != desired.geometry.height
         {
-            let (width, height) = floating_inner_size(desired.geometry);
+            let (width, height) = floating_resize_size(desired.geometry);
             commands.push(vec![
                 "resize-pane".into(),
                 "-t".into(),
@@ -558,26 +561,15 @@ impl ControlConnection {
             .stdout
             .take()
             .ok_or_else(|| Error::Protocol("tmux control stdout was unavailable".into()))?;
-        let (sender, lines) = mpsc::sync_channel(256);
+        let (sender, lines) = mpsc::sync_channel(CONTROL_LINE_CHANNEL_CAPACITY);
         thread::Builder::new()
             .name("tmnotify-tmux-control".into())
             .spawn(move || {
                 let mut reader = BufReader::new(stdout);
                 loop {
-                    let mut line = String::new();
-                    match reader.read_line(&mut line) {
-                        Ok(0) => break,
-                        Ok(_) if line.len() > MAX_CONTROL_LINE_BYTES => {
-                            let _ = sender.send(Err(std::io::Error::new(
-                                std::io::ErrorKind::InvalidData,
-                                "tmux control line exceeded limit",
-                            )));
-                            break;
-                        }
-                        Ok(_) => {
-                            while line.ends_with(['\n', '\r']) {
-                                line.pop();
-                            }
+                    match read_bounded_control_line(&mut reader, MAX_CONTROL_LINE_BYTES) {
+                        Ok(None) => break,
+                        Ok(Some(line)) => {
                             if sender.send(Ok(line)).is_err() {
                                 break;
                             }
@@ -610,14 +602,34 @@ impl ControlConnection {
         if commands.is_empty() {
             return Err(Error::Protocol("empty tmux command batch".into()));
         }
-        let ticket = CommandTicket(self.next_ticket);
-        self.next_ticket = self.next_ticket.wrapping_add(1).max(1);
-        self.parser.submitted(ticket);
         let encoded = encode_batch(commands)?;
+        // tmux emits one %begin/%end pair per command even when commands are
+        // written in one semicolon-separated control-mode batch. Register and
+        // drain every pair before returning, otherwise a later snapshot can
+        // consume the tail of the previous batch as its own response.
+        let tickets = commands
+            .iter()
+            .map(|_| {
+                let ticket = CommandTicket(self.next_ticket);
+                self.next_ticket = self.next_ticket.wrapping_add(1).max(1);
+                self.parser.submitted(ticket);
+                ticket
+            })
+            .collect::<Vec<_>>();
         self.stdin.write_all(encoded.as_bytes())?;
         self.stdin.write_all(b"\n")?;
         self.stdin.flush()?;
-        self.wait_for(ticket)
+        let mut combined = CommandResult {
+            ticket: tickets[0],
+            output: Vec::new(),
+            success: true,
+        };
+        for ticket in tickets {
+            let result = self.wait_for(ticket)?;
+            combined.success &= result.success;
+            combined.output.extend(result.output);
+        }
+        Ok(combined)
     }
 
     fn next_event(&mut self) -> Result<Option<Event>, Error> {
@@ -667,19 +679,78 @@ impl ControlConnection {
                 ControlItem::Command(result) => {
                     self.results.insert(result.ticket, result);
                 }
-                ControlItem::Event(event) => self.events.push_back(event),
+                ControlItem::Event(event) => enqueue_event(&mut self.events, event),
             }
         }
         Ok(())
     }
 }
 
+fn enqueue_event(events: &mut VecDeque<Event>, event: Event) {
+    // All translated events are invalidation signals rather than a lossless
+    // journal. Coalesce repeats so an event storm cannot grow memory while a
+    // command is in flight.
+    if !events.contains(&event) {
+        events.push_back(event);
+    }
+}
+
+/// Read one control-mode record without ever growing the destination beyond
+/// the named limit. `BufRead::read_line` cannot provide this guarantee because
+/// it allocates through the delimiter before the caller can inspect length.
+fn read_bounded_control_line(
+    reader: &mut impl BufRead,
+    maximum: usize,
+) -> std::io::Result<Option<String>> {
+    debug_assert!(maximum > 0);
+    let mut bytes = Vec::with_capacity(maximum.min(4096));
+    loop {
+        let available = reader.fill_buf()?;
+        if available.is_empty() {
+            if bytes.is_empty() {
+                return Ok(None);
+            }
+            return decode_control_line(bytes).map(Some);
+        }
+        let consumed = available
+            .iter()
+            .position(|byte| *byte == b'\n')
+            .map_or(available.len(), |position| position + 1);
+        if bytes.len().saturating_add(consumed) > maximum {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "tmux control line exceeded limit",
+            ));
+        }
+        let complete = available[consumed - 1] == b'\n';
+        bytes.extend_from_slice(&available[..consumed]);
+        reader.consume(consumed);
+        if complete {
+            return decode_control_line(bytes).map(Some);
+        }
+    }
+}
+
+fn decode_control_line(mut bytes: Vec<u8>) -> std::io::Result<String> {
+    while bytes.ends_with(b"\n") || bytes.ends_with(b"\r") {
+        bytes.pop();
+    }
+    String::from_utf8(bytes)
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))
+}
+
 impl Drop for ControlConnection {
     fn drop(&mut self) {
-        let _ = self.stdin.write_all(b"detach-client\n");
-        let _ = self.stdin.flush();
+        // Never risk blocking on a full control stdin during shutdown. SIGKILL
+        // closes the observer without mutating user hooks or key bindings.
         let _ = self.child.kill();
-        let _ = self.child.wait();
+        let deadline = Instant::now() + CONTROL_CHILD_SHUTDOWN_WAIT;
+        while Instant::now() < deadline {
+            match self.child.try_wait() {
+                Ok(Some(_)) | Err(_) => break,
+                Ok(None) => thread::sleep(CONTROL_CHILD_STATUS_POLL),
+            }
+        }
     }
 }
 
@@ -792,11 +863,11 @@ fn break_floating_command(pane: &PaneId, window: &WindowId, geometry: Geometry) 
     ]
 }
 
-fn floating_inner_size(geometry: Geometry) -> (u16, u16) {
-    (
-        geometry.width.saturating_sub(2).max(1),
-        geometry.height.saturating_sub(2).max(1),
-    )
+fn floating_resize_size(geometry: Geometry) -> (u16, u16) {
+    // Like break-pane -x/-y, resize-pane accepts the complete floating pane
+    // dimensions. pane_width/pane_height later report the bordered content
+    // area, which is two cells smaller in each dimension.
+    (geometry.width.max(1), geometry.height.max(1))
 }
 
 fn append_relative_moves(
@@ -846,6 +917,8 @@ fn jump_commands(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Cursor;
+
     use crate::notification::{Notification, NotificationDraft, Presentation};
     use crate::protocol::RendererMessage;
     use chrono::Utc;
@@ -1018,9 +1091,9 @@ mod tests {
     }
 
     #[test]
-    fn resize_converts_outer_display_geometry_to_floating_content_size() {
-        assert_eq!(floating_inner_size(geometry(0, 0, 42, 5, 0)), (40, 3));
-        assert_eq!(floating_inner_size(geometry(0, 0, 1, 1, 0)), (1, 1));
+    fn resize_uses_complete_floating_geometry() {
+        assert_eq!(floating_resize_size(geometry(0, 0, 42, 5, 0)), (42, 5));
+        assert_eq!(floating_resize_size(geometry(0, 0, 1, 1, 0)), (1, 1));
     }
 
     #[test]
@@ -1029,6 +1102,53 @@ mod tests {
         assert!(validate_stable_id("%1; kill-server", '%').is_err());
         assert!(validate_display_id("019abc:@2").is_ok());
         assert!(validate_display_id("bad\ncommand").is_err());
+    }
+
+    #[test]
+    fn control_reader_enforces_limit_before_reading_through_delimiter() {
+        let mut exact = vec![b'x'; MAX_CONTROL_LINE_BYTES - 1];
+        exact.push(b'\n');
+        let line = read_bounded_control_line(&mut Cursor::new(exact), MAX_CONTROL_LINE_BYTES)
+            .unwrap()
+            .unwrap();
+        assert_eq!(line.len(), MAX_CONTROL_LINE_BYTES - 1);
+
+        let mut oversized = vec![b'x'; MAX_CONTROL_LINE_BYTES];
+        oversized.push(b'\n');
+        let error = read_bounded_control_line(&mut Cursor::new(oversized), MAX_CONTROL_LINE_BYTES)
+            .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn control_reader_handles_eof_crlf_and_invalid_utf8() {
+        let mut records = Cursor::new(b"one\r\ntwo".to_vec());
+        assert_eq!(
+            read_bounded_control_line(&mut records, 16).unwrap(),
+            Some("one".into())
+        );
+        assert_eq!(
+            read_bounded_control_line(&mut records, 16).unwrap(),
+            Some("two".into())
+        );
+        assert_eq!(read_bounded_control_line(&mut records, 16).unwrap(), None);
+
+        let error = read_bounded_control_line(&mut Cursor::new(vec![0xff, b'\n']), 16).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn repeated_control_events_are_coalesced() {
+        let mut events = VecDeque::new();
+        for _ in 0..10_000 {
+            enqueue_event(&mut events, Event::TopologyChanged);
+        }
+        enqueue_event(&mut events, Event::Disconnected);
+        enqueue_event(&mut events, Event::Disconnected);
+        assert_eq!(
+            events,
+            VecDeque::from([Event::TopologyChanged, Event::Disconnected])
+        );
     }
 
     #[test]
@@ -1041,6 +1161,145 @@ mod tests {
                 strings(&["select-pane", "-t", "%99"]),
             ]
         );
+    }
+
+    #[test]
+    #[ignore = "requires the pinned tmux next-3.8 capability surface and util-linux script"]
+    fn isolated_jump_resolves_source_pane_after_it_moves() {
+        struct ServerGuard(PathBuf);
+        impl Drop for ServerGuard {
+            fn drop(&mut self) {
+                let _ = Command::new("tmux")
+                    .arg("-S")
+                    .arg(&self.0)
+                    .arg("kill-server")
+                    .status();
+            }
+        }
+
+        fn tmux(socket: &Path, arguments: &[&str]) -> String {
+            let output = Command::new("tmux")
+                .arg("-S")
+                .arg(socket)
+                .args(arguments)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "tmux failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            String::from_utf8(output.stdout).unwrap().trim().to_owned()
+        }
+
+        let directory = tempfile::tempdir().unwrap();
+        let socket = directory.path().join("jump.sock");
+        let status = Command::new("tmux")
+            .arg("-S")
+            .arg(&socket)
+            .arg("-f")
+            .arg("/dev/null")
+            .args(["new-session", "-d", "-s", "tmnotify-jump", "sleep 30"])
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let _guard = ServerGuard(socket.clone());
+        tmux(
+            &socket,
+            &["new-window", "-d", "-t", "tmnotify-jump", "sleep 30"],
+        );
+        let source_pane = tmux(
+            &socket,
+            &[
+                "display-message",
+                "-p",
+                "-t",
+                "tmnotify-jump:1",
+                "#{pane_id}",
+            ],
+        );
+        let original_pane = tmux(
+            &socket,
+            &[
+                "display-message",
+                "-p",
+                "-t",
+                "tmnotify-jump:0",
+                "#{pane_id}",
+            ],
+        );
+        let target_window = tmux(
+            &socket,
+            &[
+                "display-message",
+                "-p",
+                "-t",
+                "tmnotify-jump:0",
+                "#{window_id}",
+            ],
+        );
+        tmux(&socket, &["select-window", "-t", &target_window]);
+
+        let attach_command = format!(
+            "exec tmux -S {} attach-session -t tmnotify-jump",
+            socket.display()
+        );
+        let mut attached = Command::new("script")
+            .args(["-q", "-c", &attach_command, "/dev/null"])
+            .env("TERM", "xterm-256color")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let client = (0..50)
+            .find_map(|_| {
+                let clients = tmux(
+                    &socket,
+                    &[
+                        "list-clients",
+                        "-F",
+                        "#{client_name}\t#{client_control_mode}",
+                    ],
+                );
+                let client = clients.lines().find_map(|line| {
+                    let (name, control) = line.split_once('\t')?;
+                    (control == "0").then(|| name.to_owned())
+                });
+                if client.is_none() {
+                    thread::sleep(Duration::from_millis(10));
+                }
+                client
+            })
+            .expect("a real display client attached through a PTY");
+
+        tmux(
+            &socket,
+            &["move-pane", "-d", "-s", &source_pane, "-t", &original_pane],
+        );
+        tmux(&socket, &["select-pane", "-t", &original_pane]);
+        let renderer = std::env::current_exe().unwrap();
+        let mut backend = ProductionBackend::connect(Server::new(&socket), renderer).unwrap();
+        backend
+            .jump(&JumpTarget {
+                pane_id: PaneId(source_pane.clone()),
+                likely_client: Some(client.clone()),
+            })
+            .unwrap();
+        let selected = tmux(
+            &socket,
+            &[
+                "display-message",
+                "-p",
+                "-c",
+                &client,
+                "#{window_id}\t#{pane_id}",
+            ],
+        );
+        assert_eq!(selected, format!("{target_window}\t{source_pane}"));
+
+        let _ = attached.kill();
+        let _ = attached.wait();
     }
 
     #[test]
@@ -1071,12 +1330,16 @@ mod tests {
             .unwrap();
         assert!(status.success());
         let _guard = ServerGuard(socket.clone());
+        let global_hooks_before =
+            crate::tmux::capability::run_tmux(&socket, &["show-hooks", "-g"]).unwrap();
+        let global_keys_before =
+            crate::tmux::capability::run_tmux(&socket, &["list-keys"]).unwrap();
 
         let renderer = directory.path().join("renderer helper");
         std::fs::write(&renderer, "#!/bin/sh\nsleep 30\n").unwrap();
         std::fs::set_permissions(&renderer, std::fs::Permissions::from_mode(0o700)).unwrap();
 
-        let mut backend = ProductionBackend::connect(Server::new(socket), renderer).unwrap();
+        let mut backend = ProductionBackend::connect(Server::new(&socket), renderer).unwrap();
         let capabilities = backend.capabilities().unwrap();
         assert!(capabilities.supports_display_service());
         let topology = backend.topology().unwrap();
@@ -1130,7 +1393,9 @@ mod tests {
             .values()
             .find(|pane| pane.is_floating)
             .unwrap_or_else(|| panic!("no floating pane after update: {topology:?}"));
-        assert_eq!((pane.left, pane.top), (8, 5));
+        // pane_left/pane_top describe the inner content origin; the desired
+        // geometry includes the floating border, so both are offset by one.
+        assert_eq!((pane.left, pane.top), (9, 6));
         assert_eq!((pane.width, pane.height), (34, 7));
 
         backend.reconcile(&DisplayPlan::default()).unwrap();
@@ -1141,6 +1406,14 @@ mod tests {
                 .panes
                 .values()
                 .any(|pane| pane.is_floating)
+        );
+        assert_eq!(
+            crate::tmux::capability::run_tmux(&socket, &["show-hooks", "-g"]).unwrap(),
+            global_hooks_before
+        );
+        assert_eq!(
+            crate::tmux::capability::run_tmux(&socket, &["list-keys"]).unwrap(),
+            global_keys_before
         );
     }
 }

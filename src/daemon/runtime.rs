@@ -20,7 +20,7 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{UnixListener, UnixStream};
-use tokio::sync::{Mutex, Semaphore};
+use tokio::sync::{Mutex, Semaphore, watch};
 use tokio::task::JoinSet;
 use tokio::time::{sleep, timeout};
 
@@ -32,6 +32,13 @@ use crate::protocol::{
 use crate::render::{RendererSessions, RendererStream, WindowDisplayId};
 
 const SOCKET_MODE: u32 = 0o600;
+const DAEMON_START_ATTEMPTS: u32 = 40;
+const DAEMON_START_INITIAL_DELAY: Duration = Duration::from_millis(10);
+const DAEMON_START_DELAY_STEP: Duration = Duration::from_millis(5);
+const DAEMON_START_MAX_DELAY_STEPS: u32 = 20;
+const RESPONSE_TIMEOUT: Duration = Duration::from_secs(2);
+const IDEMPOTENCY_LOCK_STRIPES: usize = 64;
+const REQUEST_SHUTDOWN_GRACE: Duration = Duration::from_millis(100);
 
 /// Stable identity for one canonical tmux server socket.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -410,7 +417,13 @@ where
     let connections = Arc::new(Semaphore::new(limits.max_connections));
     let inflight = Arc::new(Semaphore::new(limits.max_inflight));
     let cache = Arc::new(Mutex::new(RequestResultCache::<Vec<u8>>::default()));
+    let idempotency_locks = Arc::new(
+        (0..IDEMPOTENCY_LOCK_STRIPES)
+            .map(|_| Mutex::new(()))
+            .collect::<Vec<_>>(),
+    );
     let mut tasks = JoinSet::new();
+    let (stop_connections, stop_rx) = watch::channel(false);
     tokio::pin!(shutdown);
 
     let reason = loop {
@@ -421,51 +434,97 @@ where
                 let Ok(permit) = connections.clone().try_acquire_owned() else { continue };
                 tasks.spawn(connection_loop(
                     stream,
-                    limits,
-                    handler.clone(),
-                    renderer_broker.clone(),
-                    inflight.clone(),
-                    cache.clone(),
+                    ConnectionContext {
+                        limits,
+                        handler: handler.clone(),
+                        renderer_broker: renderer_broker.clone(),
+                        inflight: inflight.clone(),
+                        cache: cache.clone(),
+                        idempotency_locks: idempotency_locks.clone(),
+                        shutdown: stop_rx.clone(),
+                    },
                     permit,
                 ));
             }
         }
     };
 
-    tasks.abort_all();
-    let deadline = async {
+    let _ = stop_connections.send(true);
+    // Give accepted handlers a short transactional grace period, while
+    // reserving most of the documented two-second window for closing Window
+    // Displays, recording lifecycle state, and flushing History.
+    let connection_budget = REQUEST_SHUTDOWN_GRACE
+        .min(limits.shutdown_timeout / 2)
+        .max(Duration::from_nanos(1))
+        .min(limits.shutdown_timeout);
+    let cleanup_budget = limits.shutdown_timeout.saturating_sub(connection_budget);
+    let connections_timed_out = timeout(connection_budget, async {
         while tasks.join_next().await.is_some() {}
-        cleanup(reason).await;
-    };
-    timeout(limits.shutdown_timeout, deadline)
+    })
+    .await
+    .is_err();
+    if connections_timed_out {
+        tasks.abort_all();
+        while tasks.join_next().await.is_some() {}
+    }
+    timeout(cleanup_budget, cleanup(reason))
         .await
         .map_err(|_| RuntimeError::ShutdownTimedOut)?;
     drop(owned);
+    if connections_timed_out {
+        return Err(RuntimeError::ShutdownTimedOut);
+    }
     Ok(reason)
 }
 
-async fn connection_loop<H, HF>(
-    stream: UnixStream,
+struct ConnectionContext<H> {
     limits: RuntimeLimits,
     handler: H,
     renderer_broker: Option<Arc<dyn RendererBroker>>,
     inflight: Arc<Semaphore>,
     cache: Arc<Mutex<RequestResultCache<Vec<u8>>>>,
+    idempotency_locks: Arc<Vec<Mutex<()>>>,
+    shutdown: watch::Receiver<bool>,
+}
+
+async fn connection_loop<H, HF>(
+    stream: UnixStream,
+    context: ConnectionContext<H>,
     _connection: tokio::sync::OwnedSemaphorePermit,
 ) where
     H: Fn(RequestEnvelope) -> HF + Clone + Send + Sync + 'static,
     HF: Future<Output = Result<Value, String>> + Send + 'static,
 {
+    let ConnectionContext {
+        limits,
+        handler,
+        renderer_broker,
+        inflight,
+        cache,
+        idempotency_locks,
+        mut shutdown,
+    } = context;
     let (mut reader, writer) = stream.into_split();
     let writer = Arc::new(Mutex::new(writer));
     let per_connection = Arc::new(Semaphore::new(limits.max_inflight_per_connection));
     let mut decoder = FrameDecoder::default();
     let mut buffer = [0_u8; 8192];
     let mut first_frame = true;
+    let mut requests = JoinSet::new();
     loop {
-        let Ok(result) = timeout(limits.connection_idle, reader.read(&mut buffer)).await else {
-            break;
+        // Completed tasks retain their outputs in a JoinSet until joined. Reap
+        // them before reading more input so a long-lived multiplexed
+        // connection remains bounded by its configured in-flight limit.
+        while requests.try_join_next().is_some() {}
+        let result = tokio::select! {
+            biased;
+            changed = shutdown.changed() => {
+                let _ = changed;
+                break;
+            }
+            result = timeout(limits.connection_idle, reader.read(&mut buffer)) => result,
         };
+        let Ok(result) = result else { break };
         let Ok(read) = result else { break };
         if read == 0 {
             break;
@@ -501,6 +560,7 @@ async fn connection_loop<H, HF>(
                     redemption.window_display_id().to_owned(),
                     generation,
                     stream.into_receiver(),
+                    &mut shutdown,
                 )
                 .await;
                 return;
@@ -514,11 +574,12 @@ async fn connection_loop<H, HF>(
             };
             let writer = writer.clone();
             let cache = cache.clone();
+            let idempotency_locks = idempotency_locks.clone();
             let handler = handler.clone();
-            tokio::spawn(async move {
+            requests.spawn(async move {
                 let _local = local;
                 let _global = global;
-                let response = process_frame(&frame, handler, cache).await;
+                let response = process_frame(&frame, handler, cache, idempotency_locks).await;
                 if let Ok(mut response) = response {
                     response.push(b'\n');
                     let _ = writer.lock().await.write_all(&response).await;
@@ -526,6 +587,10 @@ async fn connection_loop<H, HF>(
             });
         }
     }
+    // A response transport can disappear after scheduler mutation but before
+    // History/cache commit. Complete accepted work before releasing the
+    // connection task, so retrying the same request ID cannot duplicate it.
+    while requests.join_next().await.is_some() {}
 }
 
 async fn renderer_connection_loop(
@@ -535,6 +600,7 @@ async fn renderer_connection_loop(
     display_id: String,
     generation: u64,
     messages: Receiver<RendererMessage>,
+    shutdown: &mut watch::Receiver<bool>,
 ) {
     const STREAM_TICK: Duration = Duration::from_millis(20);
     const MAX_MESSAGES_PER_TICK: usize = 16;
@@ -543,6 +609,10 @@ async fn renderer_connection_loop(
     let mut ticker = tokio::time::interval(STREAM_TICK);
     loop {
         tokio::select! {
+            changed = shutdown.changed() => {
+                let _ = changed;
+                return;
+            }
             _ = ticker.tick() => {
                 for _ in 0..MAX_MESSAGES_PER_TICK {
                     match messages.try_recv() {
@@ -588,12 +658,25 @@ async fn process_frame<H, HF>(
     frame: &[u8],
     handler: H,
     cache: Arc<Mutex<RequestResultCache<Vec<u8>>>>,
+    idempotency_locks: Arc<Vec<Mutex<()>>>,
 ) -> Result<Vec<u8>, RuntimeError>
 where
     H: Fn(RequestEnvelope) -> HF,
     HF: Future<Output = Result<Value, String>>,
 {
     let request = RequestEnvelope::decode(frame)?;
+    // A retry may arrive while the first attempt is still executing. Lock a
+    // fixed stripe derived solely from request ID, then inspect the completed
+    // cache. This closes the cache-miss race without an attacker-growable map.
+    let stripe = request
+        .request_id
+        .as_bytes()
+        .iter()
+        .fold(0_usize, |hash, byte| {
+            hash.wrapping_mul(31) ^ usize::from(*byte)
+        })
+        % idempotency_locks.len();
+    let _idempotency = idempotency_locks[stripe].lock().await;
     let now = Instant::now();
     match cache.lock().await.lookup(&request, now) {
         CacheLookup::Replay(response) => return Ok(response),
@@ -646,7 +729,7 @@ pub async fn submit_lazy(
         Err(error) => return Err(error),
     }
     spawn_hidden_daemon(tmux_socket)?;
-    for attempt in 0..40_u32 {
+    for attempt in 0..DAEMON_START_ATTEMPTS {
         match exchange(socket, request).await {
             Ok(response) => return Ok(response),
             Err(RuntimeError::Connect(error))
@@ -655,7 +738,11 @@ pub async fn submit_lazy(
                     io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused
                 ) =>
             {
-                sleep(Duration::from_millis(10 + u64::from(attempt.min(20)) * 5)).await;
+                sleep(
+                    DAEMON_START_INITIAL_DELAY
+                        + DAEMON_START_DELAY_STEP * attempt.min(DAEMON_START_MAX_DELAY_STEPS),
+                )
+                .await;
             }
             Err(error) => return Err(error),
         }
@@ -678,7 +765,7 @@ async fn exchange(socket: &Path, request: &[u8]) -> Result<Vec<u8>, RuntimeError
     let mut decoder = FrameDecoder::default();
     let mut chunk = [0_u8; 4096];
     loop {
-        let read = timeout(Duration::from_secs(2), stream.read(&mut chunk))
+        let read = timeout(RESPONSE_TIMEOUT, stream.read(&mut chunk))
             .await
             .map_err(|_| RuntimeError::ResponseTimedOut)??;
         if read == 0 {
@@ -768,6 +855,8 @@ fn effective_user_id() -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::future::pending;
+
     use crate::notification::{Notification, NotificationDraft, Presentation};
     use crate::protocol::{RendererContent, RendererRedemption, RendererTermination};
     use crate::render::{SessionLimits, WindowDisplayId};
@@ -776,7 +865,7 @@ mod tests {
     use std::sync::Mutex as StdMutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
-    use tokio::sync::oneshot;
+    use tokio::sync::{Notify, oneshot};
     use uuid::Uuid;
 
     fn private_dir() -> tempfile::TempDir {
@@ -795,6 +884,39 @@ mod tests {
             ServerIdentity::from_canonical(path, 11).server_id()
         );
         assert_eq!(first.server_id().len(), 32);
+    }
+
+    #[test]
+    fn every_runtime_limit_rejects_zero_at_the_boundary() {
+        let valid = RuntimeLimits::default();
+        assert!(valid.validate().is_ok());
+        for invalid in [
+            RuntimeLimits {
+                max_connections: 0,
+                ..valid
+            },
+            RuntimeLimits {
+                max_inflight: 0,
+                ..valid
+            },
+            RuntimeLimits {
+                max_inflight_per_connection: 0,
+                ..valid
+            },
+            RuntimeLimits {
+                connection_idle: Duration::ZERO,
+                ..valid
+            },
+            RuntimeLimits {
+                shutdown_timeout: Duration::ZERO,
+                ..valid
+            },
+        ] {
+            assert!(matches!(
+                invalid.validate(),
+                Err(RuntimeError::InvalidLimits)
+            ));
+        }
     }
 
     #[tokio::test]
@@ -987,6 +1109,226 @@ mod tests {
         )));
         stop_tx.send(RuntimeShutdown::Signal).unwrap();
         server.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn simultaneous_retries_execute_the_handler_once() {
+        let temp = private_dir();
+        let path = temp.path().join("daemon.sock");
+        let owner = OwnedSocket::bind(&path).unwrap();
+        let (stop_tx, stop_rx) = oneshot::channel();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let started = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        let observed_calls = Arc::clone(&calls);
+        let observed_started = Arc::clone(&started);
+        let observed_release = Arc::clone(&release);
+        let server = tokio::spawn(serve(
+            owner,
+            RuntimeLimits::default(),
+            move |_| {
+                let calls = Arc::clone(&observed_calls);
+                let started = Arc::clone(&observed_started);
+                let release = Arc::clone(&observed_release);
+                async move {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    started.notify_one();
+                    release.notified().await;
+                    Ok(json!({"accepted": true}))
+                }
+            },
+            async { stop_rx.await.unwrap() },
+            |_| async {},
+        ));
+
+        let request = Arc::new(
+            serde_json::to_vec(&json!({"version":1,"request_id":Uuid::now_v7(),"type":"history"}))
+                .unwrap(),
+        );
+        let first = tokio::spawn({
+            let path = path.clone();
+            let request = Arc::clone(&request);
+            async move { exchange(&path, &request).await.unwrap() }
+        });
+        timeout(Duration::from_secs(1), started.notified())
+            .await
+            .unwrap();
+        let second = tokio::spawn({
+            let path = path.clone();
+            let request = Arc::clone(&request);
+            async move { exchange(&path, &request).await.unwrap() }
+        });
+        tokio::task::yield_now().await;
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        release.notify_waiters();
+        assert_eq!(first.await.unwrap(), second.await.unwrap());
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+        stop_tx.send(RuntimeShutdown::Signal).unwrap();
+        assert_eq!(server.await.unwrap().unwrap(), RuntimeShutdown::Signal);
+    }
+
+    #[tokio::test]
+    async fn disconnect_after_acceptance_finishes_commit_before_retry() {
+        let temp = private_dir();
+        let path = temp.path().join("daemon.sock");
+        let owner = OwnedSocket::bind(&path).unwrap();
+        let (stop_tx, stop_rx) = oneshot::channel();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let accepted = Arc::new(Notify::new());
+        let finish_commit = Arc::new(Notify::new());
+        let observed_calls = Arc::clone(&calls);
+        let observed_accepted = Arc::clone(&accepted);
+        let observed_finish = Arc::clone(&finish_commit);
+        let server = tokio::spawn(serve(
+            owner,
+            RuntimeLimits::default(),
+            move |_| {
+                let calls = Arc::clone(&observed_calls);
+                let accepted = Arc::clone(&observed_accepted);
+                let finish_commit = Arc::clone(&observed_finish);
+                async move {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    accepted.notify_one();
+                    finish_commit.notified().await;
+                    Ok(json!({"accepted": true}))
+                }
+            },
+            async { stop_rx.await.unwrap() },
+            |_| async {},
+        ));
+
+        let request =
+            serde_json::to_vec(&json!({"version":1,"request_id":Uuid::now_v7(),"type":"history"}))
+                .unwrap();
+        let mut abandoned = UnixStream::connect(&path).await.unwrap();
+        abandoned.write_all(&request).await.unwrap();
+        abandoned.write_all(b"\n").await.unwrap();
+        timeout(Duration::from_secs(1), accepted.notified())
+            .await
+            .unwrap();
+        drop(abandoned);
+
+        let retry = tokio::spawn({
+            let path = path.clone();
+            let request = request.clone();
+            async move { exchange(&path, &request).await.unwrap() }
+        });
+        tokio::task::yield_now().await;
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        finish_commit.notify_waiters();
+        assert!(!retry.await.unwrap().is_empty());
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+        stop_tx.send(RuntimeShutdown::Signal).unwrap();
+        assert_eq!(server.await.unwrap().unwrap(), RuntimeShutdown::Signal);
+    }
+
+    #[tokio::test]
+    async fn malformed_frame_does_not_crash_daemon_or_poison_connection() {
+        let temp = private_dir();
+        let path = temp.path().join("daemon.sock");
+        let owner = OwnedSocket::bind(&path).unwrap();
+        let (stop_tx, stop_rx) = oneshot::channel();
+        let server = tokio::spawn(serve(
+            owner,
+            RuntimeLimits::default(),
+            |_| async { Ok(json!({"accepted": true})) },
+            async { stop_rx.await.unwrap() },
+            |_| async {},
+        ));
+
+        let id = Uuid::now_v7();
+        let valid =
+            serde_json::to_vec(&json!({"version":1,"request_id":id,"type":"history"})).unwrap();
+        let mut stream = UnixStream::connect(&path).await.unwrap();
+        stream.write_all(b"{not-json}\n").await.unwrap();
+        stream.write_all(&valid).await.unwrap();
+        stream.write_all(b"\n").await.unwrap();
+
+        let mut decoder = FrameDecoder::default();
+        let response = loop {
+            let mut chunk = [0_u8; 1024];
+            let read = timeout(Duration::from_secs(1), stream.read(&mut chunk))
+                .await
+                .unwrap()
+                .unwrap();
+            assert_ne!(read, 0);
+            if let Some(frame) = decoder.push(&chunk[..read]).unwrap().pop() {
+                break frame;
+            }
+        };
+        assert_eq!(
+            serde_json::from_slice::<Value>(&response).unwrap()["request_id"],
+            id.to_string()
+        );
+
+        stop_tx.send(RuntimeShutdown::Signal).unwrap();
+        assert_eq!(server.await.unwrap().unwrap(), RuntimeShutdown::Signal);
+    }
+
+    struct ActiveRequest(Arc<AtomicUsize>);
+
+    impl Drop for ActiveRequest {
+        fn drop(&mut self) {
+            self.0.fetch_sub(1, Ordering::SeqCst);
+        }
+    }
+
+    #[tokio::test]
+    async fn forced_shutdown_cancels_and_joins_stuck_request_handlers() {
+        let temp = private_dir();
+        let path = temp.path().join("daemon.sock");
+        let owner = OwnedSocket::bind(&path).unwrap();
+        let (stop_tx, stop_rx) = oneshot::channel();
+        let active = Arc::new(AtomicUsize::new(0));
+        let started = Arc::new(Notify::new());
+        let observed_active = Arc::clone(&active);
+        let observed_started = Arc::clone(&started);
+        let cleaned = Arc::new(AtomicUsize::new(0));
+        let observed_cleaned = Arc::clone(&cleaned);
+        let server = tokio::spawn(serve(
+            owner,
+            RuntimeLimits {
+                shutdown_timeout: Duration::from_millis(40),
+                ..RuntimeLimits::default()
+            },
+            move |_| {
+                let active = Arc::clone(&observed_active);
+                let started = Arc::clone(&observed_started);
+                async move {
+                    active.fetch_add(1, Ordering::SeqCst);
+                    let _active = ActiveRequest(active);
+                    started.notify_one();
+                    pending::<Result<Value, String>>().await
+                }
+            },
+            async { stop_rx.await.unwrap() },
+            move |_| {
+                observed_cleaned.fetch_add(1, Ordering::SeqCst);
+                async {}
+            },
+        ));
+
+        let request =
+            serde_json::to_vec(&json!({"version":1,"request_id":Uuid::now_v7(),"type":"history"}))
+                .unwrap();
+        let mut stream = UnixStream::connect(&path).await.unwrap();
+        stream.write_all(&request).await.unwrap();
+        stream.write_all(b"\n").await.unwrap();
+        timeout(Duration::from_secs(1), started.notified())
+            .await
+            .unwrap();
+        assert_eq!(active.load(Ordering::SeqCst), 1);
+
+        stop_tx.send(RuntimeShutdown::Signal).unwrap();
+        assert!(matches!(
+            server.await.unwrap(),
+            Err(RuntimeError::ShutdownTimedOut)
+        ));
+        assert_eq!(active.load(Ordering::SeqCst), 0);
+        assert_eq!(cleaned.load(Ordering::SeqCst), 1);
+        assert!(!path.exists());
     }
 
     #[test]

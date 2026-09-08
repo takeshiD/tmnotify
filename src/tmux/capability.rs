@@ -1,7 +1,14 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
+use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
+use std::process::{Command, ExitStatus, Stdio};
+use std::thread;
+use std::time::{Duration, Instant};
+
+const MAX_TMUX_OUTPUT_BYTES: usize = 4 * 1024 * 1024;
+const TMUX_COMMAND_TIMEOUT: Duration = Duration::from_secs(2);
+const CHILD_STATUS_POLL_INTERVAL: Duration = Duration::from_millis(10);
 
 const REQUIRED_FORMATS: &[&str] = &[
     "client_activity",
@@ -126,13 +133,9 @@ impl ProductionProbe {
 }
 
 pub(super) fn run_tmux(socket_path: &Path, arguments: &[&str]) -> std::io::Result<String> {
-    checked_utf8(
-        Command::new("tmux")
-            .arg("-S")
-            .arg(socket_path)
-            .args(arguments)
-            .output()?,
-    )
+    let mut command = Command::new("tmux");
+    command.arg("-S").arg(socket_path).args(arguments);
+    run_tmux_command(command)
 }
 
 pub(super) fn run_tmux_named(socket_name: &str, arguments: &[&str]) -> std::io::Result<String> {
@@ -144,16 +147,85 @@ pub(super) fn run_tmux_named(socket_name: &str, arguments: &[&str]) -> std::io::
     }
     let mut command = Command::new("tmux");
     command.arg("-L").arg(socket_name).args(arguments);
-    checked_utf8(command.output()?)
+    run_tmux_command(command)
 }
 
-fn checked_utf8(output: Output) -> std::io::Result<String> {
-    if !output.status.success() {
-        return Err(std::io::Error::other(
-            String::from_utf8_lossy(&output.stderr).trim().to_owned(),
+fn run_tmux_command(mut command: Command) -> std::io::Result<String> {
+    let mut child = command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    let Some(stdout) = child.stdout.take() else {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(std::io::Error::other("tmux stdout was unavailable"));
+    };
+    let Some(stderr) = child.stderr.take() else {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(std::io::Error::other("tmux stderr was unavailable"));
+    };
+    let stdout = thread::spawn(move || read_bounded(stdout, MAX_TMUX_OUTPUT_BYTES));
+    let stderr = thread::spawn(move || read_bounded(stderr, MAX_TMUX_OUTPUT_BYTES));
+    let deadline = Instant::now() + TMUX_COMMAND_TIMEOUT;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) => {}
+            Err(error) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(error);
+            }
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "tmux command exceeded timeout",
+            ));
+        }
+        thread::sleep(CHILD_STATUS_POLL_INTERVAL);
+    };
+    let stdout = join_reader(stdout)?;
+    let stderr = join_reader(stderr)?;
+    checked_utf8(status, stdout, stderr)
+}
+
+fn read_bounded(mut reader: impl Read, maximum: usize) -> std::io::Result<Vec<u8>> {
+    let mut output = Vec::with_capacity(maximum.min(8 * 1024));
+    reader
+        .by_ref()
+        .take(
+            u64::try_from(maximum)
+                .unwrap_or(u64::MAX - 1)
+                .saturating_add(1),
+        )
+        .read_to_end(&mut output)?;
+    if output.len() > maximum {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "tmux command output exceeded limit",
         ));
     }
-    String::from_utf8(output.stdout)
+    Ok(output)
+}
+
+fn join_reader(reader: thread::JoinHandle<std::io::Result<Vec<u8>>>) -> std::io::Result<Vec<u8>> {
+    reader
+        .join()
+        .map_err(|_| std::io::Error::other("tmux output reader panicked"))?
+}
+
+fn checked_utf8(status: ExitStatus, stdout: Vec<u8>, stderr: Vec<u8>) -> std::io::Result<String> {
+    if !status.success() {
+        return Err(std::io::Error::other(
+            String::from_utf8_lossy(&stderr).trim().to_owned(),
+        ));
+    }
+    String::from_utf8(stdout)
         .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))
 }
 
@@ -329,5 +401,12 @@ mod tests {
             probe.socket_path,
             std::path::Path::new("/tmp/socket;not-a-command")
         );
+    }
+
+    #[test]
+    fn child_output_reader_accepts_limit_and_rejects_one_byte_beyond() {
+        assert_eq!(read_bounded(&b"abcd"[..], 4).unwrap(), b"abcd");
+        let error = read_bounded(&b"abcde"[..], 4).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
     }
 }

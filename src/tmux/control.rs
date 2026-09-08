@@ -3,6 +3,9 @@ use std::fmt;
 
 use super::Event;
 
+const MAX_COMMAND_OUTPUT_LINES: usize = 4_096;
+const MAX_COMMAND_OUTPUT_BYTES: usize = 4 * 1024 * 1024;
+
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub(super) struct CommandTicket(pub(super) u64);
 
@@ -35,6 +38,7 @@ struct Active {
     ticket: CommandTicket,
     tmux_command: u64,
     output: Vec<String>,
+    output_bytes: usize,
 }
 
 impl ControlParser {
@@ -55,6 +59,14 @@ impl ControlParser {
             return Ok(vec![ControlItem::Event(event)]);
         }
         if let Some(active) = &mut self.active {
+            if active.output.len() >= MAX_COMMAND_OUTPUT_LINES
+                || active.output_bytes.saturating_add(line.len()) > MAX_COMMAND_OUTPUT_BYTES
+            {
+                return Err(ProtocolError::new(
+                    "command response exceeded the bounded output limit",
+                ));
+            }
+            active.output_bytes += line.len();
             active.output.push(line.to_owned());
         }
         Ok(Vec::new())
@@ -73,6 +85,7 @@ impl ControlParser {
             ticket,
             tmux_command: command,
             output: Vec::new(),
+            output_bytes: 0,
         });
         Ok(())
     }
@@ -221,5 +234,24 @@ mod tests {
     fn pane_output_is_not_mistaken_for_a_topology_event() {
         let mut codec = ControlParser::default();
         assert!(codec.receive("%output %1 hello").unwrap().is_empty());
+    }
+
+    #[test]
+    fn command_output_line_and_byte_counts_are_bounded() {
+        let mut by_lines = ControlParser::default();
+        by_lines.submitted(CommandTicket(1));
+        by_lines.receive("%begin 1 1 0").unwrap();
+        for _ in 0..MAX_COMMAND_OUTPUT_LINES {
+            by_lines.receive("").unwrap();
+        }
+        assert!(by_lines.receive("").is_err());
+
+        let mut by_bytes = ControlParser::default();
+        by_bytes.submitted(CommandTicket(2));
+        by_bytes.receive("%begin 1 2 0").unwrap();
+        by_bytes
+            .receive(&"x".repeat(MAX_COMMAND_OUTPUT_BYTES))
+            .unwrap();
+        assert!(by_bytes.receive("x").is_err());
     }
 }

@@ -18,7 +18,7 @@ jobs:
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
       - name: Install tmux build dependencies
-        run: sudo apt-get update && sudo apt-get install -y automake bison build-essential libevent-dev libncurses-dev pkg-config
+        run: sudo apt-get update && sudo apt-get install -y automake bison build-essential libevent-dev libncurses-dev pkg-config util-linux
       - name: Build current tmux master
         run: |
           git clone --depth=1 --branch master https://github.com/tmux/tmux.git "$RUNNER_TEMP/tmux"
@@ -34,6 +34,10 @@ jobs:
           cargo test --locked tmux::capability
           cargo test --locked tmux::control
           cargo test --locked tmux::topology
+      - name: Run isolated ProductionBackend integration tests
+        run: |
+          PATH="$RUNNER_TEMP/tmux-install/bin:$PATH" \
+            cargo test --locked tmux::production::tests::isolated_ -- --ignored
       - name: Report resolved upstream commit
         if: always()
         run: cat "$RUNNER_TEMP/tmux-master-commit"
