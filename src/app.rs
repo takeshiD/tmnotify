@@ -14,8 +14,8 @@ use tokio::sync::Mutex;
 
 use crate::cli::{
     ClearArgs, Cli, Command, DoctorArgs, HistoryAction, HistoryArgs, HookAction, HookArgs,
-    HookEventArgs, HookMutationArgs, HookScopeArg, HookSelectionArgs, ProviderArg, Selector,
-    TmuxTarget, RendererArgs,
+    HookEventArgs, HookMutationArgs, HookScopeArg, HookSelectionArgs, ProviderArg, RendererArgs,
+    Selector, TmuxTarget,
 };
 use crate::config::{Config, ConfigOverrides, FeatureMode, HooksConfig, TimeoutValue, load};
 use crate::daemon::runtime::{
@@ -36,11 +36,11 @@ use crate::protocol::{
     WireNotificationUpdate, WireSelector, decode_client_response,
 };
 use crate::providers::HookPolicy;
+use crate::renderer_runtime::{RendererKind, RendererRuntimeError, run_hidden_renderer};
 use crate::tmux::{
     Backend as _, DisplayPlan as TmuxDisplayPlan, JumpTarget, PaneId, ProductionBackend, Server,
     WindowId,
 };
-use crate::renderer_runtime::{RendererKind, RendererRuntimeError, run_hidden_renderer};
 
 /// App-facing dispatch target for both hidden renderer subcommands. Keeping it
 /// here lets the one-binary entry point route modes without learning socket or
@@ -647,16 +647,11 @@ async fn run_daemon(
     let action_service = service.clone();
     let renderer_broker = Arc::new(SessionRendererBroker::new(
         renderer_sessions,
-        move |display_id, action| {
+        move |display_id: String, action: crate::protocol::RendererAction| {
             let service = action_service.clone();
             async move {
                 service
-                    .handle_renderer_action(
-                        &display_id,
-                        action,
-                        monotonic(origin),
-                        Utc::now(),
-                    )
+                    .handle_renderer_action(&display_id, action, monotonic(origin), Utc::now())
                     .await
                     .map_err(|error| error.to_string())
             }
