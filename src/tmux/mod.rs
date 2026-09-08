@@ -13,6 +13,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::path::PathBuf;
 
+use crate::notification::{IngressError, SourceContext, TmuxServerId};
+
 pub use capability::{Capability, CapabilityReport, ProductionProbe, UnsupportedTmux};
 pub use production::{DEFAULT_TOPOLOGY_REFRESH_INTERVAL, ProductionBackend};
 pub use topology::{ClientView, Pane, Topology, TopologyParseError, WindowSize};
@@ -140,6 +142,20 @@ impl Server {
         }
     }
 
+    /// Resolves a tmux `-L` name to the server's own socket path. The name is
+    /// passed as one argv item and is never interpreted by a shell.
+    pub fn from_socket_name(socket_name: &str) -> Result<Self, Error> {
+        let output =
+            capability::run_tmux_named(socket_name, &["display-message", "-p", "#{socket_path}"])?;
+        let path = output.trim_end_matches(['\r', '\n']);
+        if path.is_empty() || path.contains(['\0', '\n', '\r']) {
+            return Err(Error::Protocol(
+                "tmux returned an invalid canonical socket path".into(),
+            ));
+        }
+        Ok(Self::new(path))
+    }
+
     pub fn probe(&self) -> Result<CapabilityReport, Error> {
         ProductionProbe::new(&self.socket_path)
             .run()
@@ -172,6 +188,85 @@ impl Server {
         )?;
         Topology::from_format_output(&clients, &panes).map_err(Error::from)
     }
+
+    /// Captures only the bounded Source Pane fields in the product contract.
+    /// The caller supplies the stable pane ID from `TMUX_PANE`; no current pane
+    /// is guessed for an outside-tmux invocation.
+    pub fn source_context(
+        &self,
+        server_id: TmuxServerId,
+        pane_id: &str,
+    ) -> Result<SourceContext, SourceCaptureError> {
+        validate_source_pane_id(pane_id)?;
+        let stable = capability::run_tmux(
+            &self.socket_path,
+            &[
+                "display-message",
+                "-t",
+                pane_id,
+                "-p",
+                "#{session_id}\t#{window_id}\t#{pane_id}",
+            ],
+        )?;
+        let fields = stable
+            .trim_end_matches(['\r', '\n'])
+            .split('\t')
+            .collect::<Vec<_>>();
+        if fields.len() != 3 || fields[2] != pane_id {
+            return Err(SourceCaptureError::InvalidResponse);
+        }
+        let mut source = SourceContext::new(server_id, fields[0], fields[1], fields[2])?;
+        for (format, kind) in [
+            ("#{pane_current_path}", SourceField::Cwd),
+            ("#{pane_current_command}", SourceField::Command),
+            ("#{pane_title}", SourceField::Title),
+        ] {
+            let value = capability::run_tmux(
+                &self.socket_path,
+                &["display-message", "-t", pane_id, "-p", format],
+            )?;
+            let value = value.trim_end_matches(['\r', '\n']);
+            if value.is_empty() {
+                continue;
+            }
+            source = match kind {
+                SourceField::Cwd => source.with_cwd(value)?,
+                SourceField::Command => source.with_command(value)?,
+                SourceField::Title => source.with_pane_title(value)?,
+            };
+        }
+        Ok(source)
+    }
+}
+
+#[derive(Clone, Copy)]
+enum SourceField {
+    Cwd,
+    Command,
+    Title,
+}
+
+fn validate_source_pane_id(value: &str) -> Result<(), SourceCaptureError> {
+    if value
+        .strip_prefix('%')
+        .is_some_and(|id| !id.is_empty() && id.bytes().all(|byte| byte.is_ascii_digit()))
+    {
+        Ok(())
+    } else {
+        Err(SourceCaptureError::InvalidPaneId)
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum SourceCaptureError {
+    #[error("TMUX_PANE is not a stable tmux pane ID")]
+    InvalidPaneId,
+    #[error("tmux returned invalid Source Pane metadata")]
+    InvalidResponse,
+    #[error(transparent)]
+    Tmux(#[from] std::io::Error),
+    #[error(transparent)]
+    Ingress(#[from] IngressError),
 }
 
 #[cfg(test)]

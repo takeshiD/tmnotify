@@ -1,17 +1,43 @@
 //! Top-level command orchestration that is independent of daemon transport.
 
-use std::io::{self, Write};
+use std::io::{self, IsTerminal, Write};
+use std::path::{Path, PathBuf};
+use std::pin::Pin;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
 
+use chrono::Utc;
+use serde_json::Value;
 use thiserror::Error;
+use tokio::sync::Mutex;
 
 use crate::cli::{
-    DoctorArgs, HookAction, HookArgs, HookMutationArgs, HookScopeArg, HookSelectionArgs,
-    ProviderArg,
+    ClearArgs, Cli, Command, DoctorArgs, HistoryAction, HistoryArgs, HookAction, HookArgs,
+    HookEventArgs, HookMutationArgs, HookScopeArg, HookSelectionArgs, ProviderArg, Selector,
+    TmuxTarget,
 };
-use crate::config::HooksConfig;
-use crate::doctor::{DoctorOutputError, SystemProbe};
-use crate::hooks::{HookError, HookManager, Scope};
-use crate::notification::Provider;
+use crate::config::{Config, ConfigOverrides, FeatureMode, HooksConfig, TimeoutValue, load};
+use crate::daemon::runtime::{
+    OwnedSocket, RuntimeError, RuntimeLimits, RuntimeShutdown, ServerIdentity, serve, submit_lazy,
+};
+use crate::daemon::{
+    DaemonService, JumpExecutor, LiveScheduler, MonotonicTime, SchedulerLimits, ShutdownReason,
+    WindowDisplayPolicy, WindowReconciler,
+};
+use crate::doctor::{DoctorOutputError, HookObservation, SystemProbe};
+use crate::history::{ClearFilter, History, HistoryError, HistoryQuery, write_ndjson, write_plain};
+use crate::hooks::{HookError, HookManager, HookSubmitter, Scope, receive_hook_event};
+use crate::notification::{Provider, SourceContext, Timeout, TmuxServerId};
+use crate::platform::{Environment, PathError, PlatformPaths, PrivateLogger};
+use crate::protocol::{
+    ClientCommand, ClientRequest, ClientResponse, ProtocolError, WireNotificationDraft,
+    WireNotificationUpdate, WireSelector, decode_client_response,
+};
+use crate::providers::HookPolicy;
+use crate::tmux::{
+    Backend as _, DisplayPlan as TmuxDisplayPlan, JumpTarget, PaneId, ProductionBackend, Server,
+};
 
 /// Hook mutations are silent on success. Status is a command result and is
 /// written to stdout by the caller-provided writer.
@@ -142,6 +168,684 @@ pub enum AppError {
     Output(#[from] io::Error),
 }
 
+/// Runs the complete public/hidden command dispatcher. Successful direct
+/// mutations remain silent unless their command requested JSON.
+pub async fn run(cli: Cli) -> Result<(), RuntimeAppError> {
+    if matches!(cli.command, Command::HookEvent(_)) {
+        run_hook_event_silent(cli).await;
+        return Ok(());
+    }
+
+    let environment = Environment::current();
+    let paths = PlatformPaths::resolve(&environment)?;
+    let tmux_environment = environment.get("TMUX").and_then(|value| value.to_str());
+    let target = cli.tmux_target(tmux_environment)?;
+    let server = target.map(resolve_server).transpose()?;
+    let selected = server
+        .map(|server| SelectedServer::new(server, &paths))
+        .transpose()?;
+    let config = load(&paths.config_file, &environment, ConfigOverrides::default())?;
+
+    match cli.command {
+        Command::Send(arguments) => {
+            let selected = require_server(selected)?;
+            let source = if arguments.no_source {
+                None
+            } else {
+                capture_source(&selected, &environment)?
+            };
+            let json = arguments.json;
+            let use_config_timeout = arguments.timeout.is_none();
+            let mut draft = arguments.into_draft(source, io::stdin().lock())?;
+            if use_config_timeout
+                && draft.presentation() == crate::notification::Presentation::Toast
+            {
+                draft = draft.with_timeout(config_timeout(config.toast.timeout));
+            }
+            submit_and_present(
+                &selected,
+                ClientCommand::Send {
+                    notification: Box::new(WireNotificationDraft::from_domain(&draft)),
+                },
+                json,
+            )
+            .await
+        }
+        Command::Update(arguments) => {
+            let selected = require_server(selected)?;
+            let json = arguments.json;
+            let selector = wire_selector(&arguments.selector);
+            let update = arguments.into_update(io::stdin().lock())?;
+            submit_and_present(
+                &selected,
+                ClientCommand::Update {
+                    selector,
+                    update: WireNotificationUpdate::from_domain(&update),
+                },
+                json,
+            )
+            .await
+        }
+        Command::Dismiss(selector) => {
+            let selected = require_server(selected)?;
+            submit_and_present(
+                &selected,
+                ClientCommand::Dismiss {
+                    selector: wire_selector(&selector),
+                },
+                false,
+            )
+            .await
+        }
+        Command::Jump(arguments) => {
+            let selected = require_server(selected)?;
+            submit_and_present(
+                &selected,
+                ClientCommand::Jump { key: arguments.key },
+                arguments.json,
+            )
+            .await
+        }
+        Command::History(arguments) => {
+            run_history(arguments, selected.as_ref(), &paths, &config).await
+        }
+        Command::Hook(arguments) => {
+            let manager = production_hook_manager(&environment)?;
+            run_hook_command(&manager, &config.hooks, arguments, io::stdout().lock())?;
+            Ok(())
+        }
+        Command::Doctor(arguments) => {
+            run_production_doctor(arguments, selected.as_ref(), &paths, &environment, &config)
+        }
+        Command::Daemon => run_daemon(require_server(selected)?, paths, config).await,
+        Command::HistoryUi(arguments) => {
+            run_history(
+                HistoryArgs {
+                    action: None,
+                    plain: true,
+                    json: false,
+                    all: false,
+                    all_servers: arguments.all_servers,
+                },
+                selected.as_ref(),
+                &paths,
+                &config,
+            )
+            .await
+        }
+        Command::RenderToast(_) | Command::RenderAttention(_) => Err(RuntimeAppError::Execution(
+            "renderer broker is not available".into(),
+        )),
+        Command::HookEvent(_) => unreachable!("hook mode returned before regular dispatch"),
+    }
+}
+
+#[derive(Clone)]
+struct SelectedServer {
+    server: Server,
+    identity: ServerIdentity,
+    daemon_socket: PathBuf,
+    domain_id: TmuxServerId,
+}
+
+impl SelectedServer {
+    fn new(server: Server, paths: &PlatformPaths) -> Result<Self, RuntimeAppError> {
+        let identity = ServerIdentity::resolve(server.socket_path())?;
+        let daemon_socket = paths.socket_path(identity.server_id())?;
+        let domain_id = TmuxServerId::new(identity.server_id())?;
+        Ok(Self {
+            server: Server::new(identity.tmux_socket()),
+            identity,
+            daemon_socket,
+            domain_id,
+        })
+    }
+}
+
+fn resolve_server(target: TmuxTarget) -> Result<Server, RuntimeAppError> {
+    Ok(match target {
+        TmuxTarget::SocketName(name) => Server::from_socket_name(&name)?,
+        TmuxTarget::SocketPath(path) => Server::new(path),
+    })
+}
+
+fn require_server(server: Option<SelectedServer>) -> Result<SelectedServer, RuntimeAppError> {
+    server.ok_or(RuntimeAppError::MissingTmuxTarget)
+}
+
+fn capture_source(
+    selected: &SelectedServer,
+    environment: &Environment,
+) -> Result<Option<SourceContext>, RuntimeAppError> {
+    let Some(tmux) = environment.get("TMUX").and_then(|value| value.to_str()) else {
+        return Ok(None);
+    };
+    let current_socket = tmux
+        .split_once(',')
+        .map(|(socket, _)| Path::new(socket))
+        .filter(|socket| !socket.as_os_str().is_empty());
+    let same_server = current_socket
+        .and_then(|socket| std::fs::canonicalize(socket).ok())
+        .is_some_and(|socket| socket == selected.identity.tmux_socket());
+    if !same_server {
+        return Ok(None);
+    }
+    let Some(pane) = environment
+        .get("TMUX_PANE")
+        .and_then(|value| value.to_str())
+    else {
+        return Ok(None);
+    };
+    selected
+        .server
+        .source_context(selected.domain_id.clone(), pane)
+        .map(Some)
+        .map_err(|error| RuntimeAppError::Execution(error.to_string()))
+}
+
+fn config_timeout(value: TimeoutValue) -> Timeout {
+    match value {
+        TimeoutValue::Never => Timeout::Never,
+        TimeoutValue::After(duration) => Timeout::After(duration.0),
+    }
+}
+
+fn wire_selector(selector: &Selector) -> WireSelector {
+    WireSelector {
+        id: selector.id.clone(),
+        key: selector.key.clone(),
+    }
+}
+
+async fn submit_and_present(
+    selected: &SelectedServer,
+    command: ClientCommand,
+    json: bool,
+) -> Result<(), RuntimeAppError> {
+    let request = ClientRequest::new(command);
+    // submit_lazy supplies exactly one delimiter. Encoding a line here would
+    // create an empty second frame on the daemon connection.
+    let payload = serde_json::to_vec(&request)?;
+    let frame = submit_lazy(
+        &selected.daemon_socket,
+        selected.identity.tmux_socket(),
+        &payload,
+    )
+    .await?;
+    let result = match decode_client_response(&frame, request.request_id)? {
+        ClientResponse::Success(value) => value,
+        ClientResponse::Error(message) => return Err(RuntimeAppError::Remote(message)),
+    };
+    if result
+        .get("history_persisted")
+        .is_some_and(|value| value == &Value::Bool(false))
+    {
+        eprintln!("warning: Notification was accepted but History could not be persisted");
+    }
+    if json {
+        serde_json::to_writer(io::stdout().lock(), &result)?;
+        println!();
+    }
+    Ok(())
+}
+
+async fn run_history(
+    arguments: HistoryArgs,
+    selected: Option<&SelectedServer>,
+    paths: &PlatformPaths,
+    config: &Config,
+) -> Result<(), RuntimeAppError> {
+    let clear_all_servers = matches!(
+        arguments.action,
+        Some(HistoryAction::Clear(ClearArgs {
+            all_servers: true,
+            ..
+        }))
+    );
+    if selected.is_none() && !arguments.all_servers && !clear_all_servers {
+        return Err(RuntimeAppError::MissingHistoryTarget);
+    }
+    let server_id = selected
+        .map(|server| server.domain_id.clone())
+        .unwrap_or_else(|| TmuxServerId::new("all-servers").expect("fixed ID is valid"));
+    let history = History::open(&paths.history_file, server_id, &config.history, Utc::now())?;
+    if let Some(HistoryAction::Clear(mut clear)) = arguments.action {
+        clear.all_servers |= arguments.all_servers;
+        return clear_history(&history, clear).await;
+    }
+    let entries = history
+        .list(HistoryQuery {
+            include_hidden: arguments.all,
+            all_servers: arguments.all_servers,
+            limit: config.history.max_entries,
+        })?
+        .wait()
+        .await?;
+    if arguments.json {
+        write_ndjson(&entries, io::stdout().lock())?;
+    } else {
+        let width = if io::stdout().is_terminal() {
+            crossterm::terminal::size().map_or(120, |(width, _)| usize::from(width))
+        } else {
+            120
+        };
+        write_plain(&entries, width, io::stdout().lock())?;
+    }
+    Ok(())
+}
+
+async fn clear_history(history: &History, arguments: ClearArgs) -> Result<(), RuntimeAppError> {
+    let filter = clear_filter(&arguments)?;
+    let count = history
+        .count_clear(filter, arguments.all_servers)?
+        .wait()
+        .await?;
+    if !arguments.yes {
+        if !io::stdin().is_terminal() {
+            return Err(RuntimeAppError::ConfirmationRequired);
+        }
+        eprint!(
+            "Delete {count} History row(s) from {}? [y/N] ",
+            if arguments.all_servers {
+                "all servers"
+            } else {
+                "the selected server"
+            }
+        );
+        io::stderr().flush()?;
+        let mut answer = String::new();
+        io::stdin().read_line(&mut answer)?;
+        if !matches!(answer.trim(), "y" | "Y" | "yes" | "YES") {
+            return Ok(());
+        }
+    }
+    let deleted = history.clear(filter, arguments.all_servers)?.wait().await?;
+    println!("deleted {deleted}");
+    Ok(())
+}
+
+fn clear_filter(arguments: &ClearArgs) -> Result<ClearFilter, RuntimeAppError> {
+    if arguments.hidden {
+        return Ok(ClearFilter::Hidden);
+    }
+    if arguments.all {
+        return Ok(ClearFilter::All);
+    }
+    let value = arguments
+        .before
+        .as_deref()
+        .ok_or_else(|| RuntimeAppError::Execution("History Clear requires a selector".into()))?;
+    let duration = parse_age(value)?;
+    let before = Utc::now()
+        - chrono::Duration::from_std(duration)
+            .map_err(|_| RuntimeAppError::InvalidAge(value.to_owned()))?;
+    Ok(ClearFilter::Before(before))
+}
+
+fn parse_age(value: &str) -> Result<Duration, RuntimeAppError> {
+    let (number, seconds) = if let Some(number) = value.strip_suffix('d') {
+        (number, 86_400_u64)
+    } else if let Some(number) = value.strip_suffix('h') {
+        (number, 3_600)
+    } else if let Some(number) = value.strip_suffix('m') {
+        (number, 60)
+    } else {
+        return Err(RuntimeAppError::InvalidAge(value.to_owned()));
+    };
+    let number = number
+        .parse::<u64>()
+        .map_err(|_| RuntimeAppError::InvalidAge(value.to_owned()))?;
+    number
+        .checked_mul(seconds)
+        .map(Duration::from_secs)
+        .ok_or_else(|| RuntimeAppError::InvalidAge(value.to_owned()))
+}
+
+fn production_hook_manager(environment: &Environment) -> Result<HookManager, RuntimeAppError> {
+    HookManager::new(
+        std::env::current_exe()?,
+        std::env::current_dir()?,
+        environment,
+    )
+    .map_err(RuntimeAppError::Hook)
+}
+
+fn run_production_doctor(
+    arguments: DoctorArgs,
+    selected: Option<&SelectedServer>,
+    paths: &PlatformPaths,
+    environment: &Environment,
+    config: &Config,
+) -> Result<(), RuntimeAppError> {
+    let manager = production_hook_manager(environment)?;
+    let mut observations = Vec::new();
+    for (provider, name) in [(Provider::Claude, "claude"), (Provider::Codex, "codex")] {
+        let provider_config = provider_config(&config.hooks, provider);
+        let statuses = manager.status_with_config(provider, provider_config)?;
+        let installed = statuses.iter().any(|status| status.installed);
+        observations.push(HookObservation {
+            provider: name,
+            installed,
+            synchronized: installed
+                && statuses
+                    .iter()
+                    .filter(|status| status.installed)
+                    .all(|status| status.in_sync),
+        });
+    }
+    let probe = SystemProbe {
+        paths,
+        environment,
+        tmux: selected.map(|selected| &selected.server),
+        daemon_socket: selected.map(|selected| selected.daemon_socket.as_path()),
+        hooks: &observations,
+    };
+    let unicode = config.display.unicode != FeatureMode::Never;
+    let healthy = run_doctor_command(&probe, arguments, io::stdout().lock(), unicode)?;
+    if healthy {
+        Ok(())
+    } else {
+        Err(RuntimeAppError::DoctorUnhealthy)
+    }
+}
+
+#[derive(Clone)]
+struct ProductionJump {
+    backend: Arc<Mutex<ProductionBackend>>,
+}
+
+impl JumpExecutor for ProductionJump {
+    fn jump(
+        &self,
+        source: SourceContext,
+    ) -> Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send + '_>> {
+        Box::pin(async move {
+            self.backend
+                .lock()
+                .await
+                .jump(&JumpTarget {
+                    pane_id: PaneId(source.pane_id().to_owned()),
+                    likely_client: None,
+                })
+                .map_err(|error| error.to_string())
+        })
+    }
+}
+
+async fn run_daemon(
+    selected: SelectedServer,
+    paths: PlatformPaths,
+    config: Config,
+) -> Result<(), RuntimeAppError> {
+    paths.ensure_private_directories()?;
+    let executable = std::env::current_exe()?;
+    let mut production = ProductionBackend::connect(selected.server.clone(), executable)?;
+    production.capabilities()?;
+    let owned = OwnedSocket::bind(&selected.daemon_socket)?;
+    let history = Arc::new(History::open(
+        &paths.history_file,
+        selected.domain_id,
+        &config.history,
+        Utc::now(),
+    )?);
+    let origin = Instant::now();
+    let scheduler = LiveScheduler::new(
+        SchedulerLimits::new(
+            usize::try_from(config.queue.max_pending).unwrap_or(10_000),
+            usize::try_from(config.toast.max_visible).unwrap_or(100),
+        )?,
+        MonotonicTime::default(),
+    );
+    let backend = Arc::new(Mutex::new(production));
+    let service = DaemonService::new(
+        scheduler,
+        Arc::clone(&history),
+        ProductionJump {
+            backend: Arc::clone(&backend),
+        },
+    );
+    let scheduler = service.scheduler();
+    let stopping = Arc::new(AtomicBool::new(false));
+    let reconcile_task = tokio::spawn(reconcile_loop(
+        Arc::clone(&backend),
+        Arc::clone(&scheduler),
+        Arc::clone(&history),
+        Arc::clone(&stopping),
+        origin,
+        WindowDisplayPolicy {
+            toast_width: u16::try_from(config.toast.width).unwrap_or(u16::MAX),
+            toast_height: u16::try_from(config.toast.height).unwrap_or(u16::MAX),
+            toast_gap: u16::try_from(config.toast.gap).unwrap_or(u16::MAX),
+            max_visible_toasts: usize::try_from(config.toast.max_visible).unwrap_or(100),
+        },
+    ));
+    let handler_service = service.clone();
+    let handler = move |envelope| {
+        let service = handler_service.clone();
+        async move {
+            service
+                .handle_envelope(&envelope, monotonic(origin), Utc::now())
+                .await
+                .and_then(|response| serde_json::to_value(response).map_err(Into::into))
+                .map_err(|error| error.to_string())
+        }
+    };
+    let shutdown_path = selected.identity.tmux_socket().to_owned();
+    let cleanup_scheduler = Arc::clone(&scheduler);
+    let cleanup_backend = Arc::clone(&backend);
+    let cleanup_history = Arc::clone(&history);
+    let cleanup_stopping = Arc::clone(&stopping);
+    let result = serve(
+        owned,
+        RuntimeLimits::default(),
+        handler,
+        shutdown_signal(shutdown_path),
+        move |reason| async move {
+            cleanup_stopping.store(true, Ordering::Release);
+            let reason = match reason {
+                RuntimeShutdown::Signal => ShutdownReason::Stopped,
+                RuntimeShutdown::ServerEnded => ShutdownReason::ServerEnded,
+            };
+            let snapshots = {
+                let mut scheduler = cleanup_scheduler.lock().await;
+                let _ = scheduler.shutdown(reason, monotonic(origin), Utc::now());
+                scheduler.drain_closed()
+            };
+            persist_all(&cleanup_history, snapshots).await;
+            let _ = cleanup_backend
+                .lock()
+                .await
+                .reconcile(&TmuxDisplayPlan::default());
+            if let Ok(task) = cleanup_history.flush() {
+                let _ = task.wait().await;
+            }
+        },
+    )
+    .await;
+    stopping.store(true, Ordering::Release);
+    reconcile_task.abort();
+    result?;
+    Ok(())
+}
+
+async fn reconcile_loop(
+    backend: Arc<Mutex<ProductionBackend>>,
+    scheduler: Arc<Mutex<LiveScheduler>>,
+    history: Arc<History>,
+    stopping: Arc<AtomicBool>,
+    origin: Instant,
+    policy: WindowDisplayPolicy,
+) {
+    let mut reconciler = WindowReconciler::new(policy, MonotonicTime::default());
+    while !stopping.load(Ordering::Acquire) {
+        let snapshots = {
+            let mut backend = backend.lock().await;
+            let mut scheduler = scheduler.lock().await;
+            let _ = reconciler.tick(&mut *backend, &mut scheduler, monotonic(origin), Utc::now());
+            scheduler.drain_closed()
+        };
+        persist_all(&history, snapshots).await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+async fn persist_all(history: &History, snapshots: Vec<crate::notification::Notification>) {
+    for notification in snapshots {
+        if let Ok(task) = history.persist(&notification) {
+            let _ = task.wait().await;
+        }
+    }
+}
+
+fn monotonic(origin: Instant) -> MonotonicTime {
+    MonotonicTime::from_duration(origin.elapsed())
+}
+
+async fn shutdown_signal(tmux_socket: PathBuf) -> RuntimeShutdown {
+    let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+        .expect("SIGTERM handler installation failed");
+    loop {
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => return RuntimeShutdown::Signal,
+            _ = terminate.recv() => return RuntimeShutdown::Signal,
+            _ = tokio::time::sleep(Duration::from_millis(500)) => {
+                if std::fs::symlink_metadata(&tmux_socket).is_err() {
+                    return RuntimeShutdown::ServerEnded;
+                }
+            }
+        }
+    }
+}
+
+struct RuntimeHookSubmitter {
+    selected: SelectedServer,
+    handle: tokio::runtime::Handle,
+}
+
+impl HookSubmitter for RuntimeHookSubmitter {
+    type Error = String;
+
+    fn submit_and_wait(
+        &self,
+        notification: crate::notification::NotificationDraft,
+        ack_timeout: Duration,
+    ) -> Result<(), Self::Error> {
+        let request = ClientRequest::new(ClientCommand::Send {
+            notification: Box::new(WireNotificationDraft::from_domain(&notification)),
+        });
+        let payload = serde_json::to_vec(&request).map_err(|error| error.to_string())?;
+        self.handle.block_on(async {
+            tokio::time::timeout(
+                ack_timeout,
+                submit_lazy(
+                    &self.selected.daemon_socket,
+                    self.selected.identity.tmux_socket(),
+                    &payload,
+                ),
+            )
+            .await
+            .map_err(|_| "hook acknowledgement timed out".to_owned())?
+            .map_err(|error| error.to_string())
+            .and_then(|frame| {
+                match decode_client_response(&frame, request.request_id)
+                    .map_err(|error| error.to_string())?
+                {
+                    ClientResponse::Success(_) => Ok(()),
+                    ClientResponse::Error(error) => Err(error),
+                }
+            })
+        })
+    }
+}
+
+async fn run_hook_event_silent(cli: Cli) {
+    let Command::HookEvent(HookEventArgs { provider }) = cli.command else {
+        return;
+    };
+    let provider: Provider = provider.into();
+    let environment = Environment::current();
+    let operation = || -> Result<_, RuntimeAppError> {
+        let paths = PlatformPaths::resolve(&environment)?;
+        let config = load(&paths.config_file, &environment, ConfigOverrides::default())?;
+        let tmux_environment = environment.get("TMUX").and_then(|value| value.to_str());
+        let target = cli.tmux_target(tmux_environment)?;
+        let selected = SelectedServer::new(
+            resolve_server(target.ok_or(RuntimeAppError::MissingTmuxTarget)?)?,
+            &paths,
+        )?;
+        let source = capture_source(&selected, &environment)?;
+        let logger = PrivateLogger::new(paths.log_file).ok();
+        Ok((selected, config, source, logger))
+    }();
+    let Ok((selected, config, source, logger)) = operation else {
+        return;
+    };
+    let policy = HookPolicy::from(provider_config(&config.hooks, provider));
+    let submitter = RuntimeHookSubmitter {
+        selected,
+        handle: tokio::runtime::Handle::current(),
+    };
+    let _ = tokio::task::spawn_blocking(move || {
+        receive_hook_event(
+            provider,
+            io::stdin().lock(),
+            &policy,
+            source,
+            &submitter,
+            logger.as_ref(),
+        );
+    })
+    .await;
+}
+
+#[derive(Debug, Error)]
+pub enum RuntimeAppError {
+    #[error("a tmux target is required; run inside tmux or pass -L/-S")]
+    MissingTmuxTarget,
+    #[error("History outside tmux requires -L, -S, or --all-servers")]
+    MissingHistoryTarget,
+    #[error("non-interactive History Clear requires --yes")]
+    ConfirmationRequired,
+    #[error("invalid --before age {0:?}; use a positive m, h, or d duration")]
+    InvalidAge(String),
+    #[error("doctor found failing diagnostics")]
+    DoctorUnhealthy,
+    #[error("daemon rejected the request: {0}")]
+    Remote(String),
+    #[error("{0}")]
+    Execution(String),
+    #[error(transparent)]
+    App(#[from] AppError),
+    #[error(transparent)]
+    Cli(#[from] crate::cli::CliError),
+    #[error(transparent)]
+    CliBuild(#[from] crate::cli::CliBuildError),
+    #[error(transparent)]
+    Config(#[from] crate::config::ConfigError),
+    #[error(transparent)]
+    History(#[from] HistoryError),
+    #[error(transparent)]
+    HistoryOutput(#[from] crate::history::HistoryOutputError),
+    #[error(transparent)]
+    Hook(#[from] HookError),
+    #[error(transparent)]
+    Path(#[from] PathError),
+    #[error(transparent)]
+    Protocol(#[from] ProtocolError),
+    #[error(transparent)]
+    Runtime(#[from] RuntimeError),
+    #[error(transparent)]
+    Scheduler(#[from] crate::daemon::SchedulerError),
+    #[error(transparent)]
+    Tmux(#[from] crate::tmux::Error),
+    #[error(transparent)]
+    Json(#[from] serde_json::Error),
+    #[error(transparent)]
+    Io(#[from] io::Error),
+    #[error(transparent)]
+    Ingress(#[from] crate::notification::IngressError),
+}
+
 #[cfg(test)]
 mod tests {
     use std::ffi::OsString;
@@ -233,5 +937,14 @@ mod tests {
         });
         assert_eq!(scope, Scope::User);
         assert!(allow_mixed);
+    }
+
+    #[test]
+    fn clear_age_is_bounded_and_requires_an_explicit_unit() {
+        assert_eq!(parse_age("30d").unwrap(), Duration::from_secs(30 * 86_400));
+        assert_eq!(parse_age("2h").unwrap(), Duration::from_secs(7_200));
+        assert!(parse_age("30").is_err());
+        assert!(parse_age("forever").is_err());
+        assert!(parse_age("18446744073709551615d").is_err());
     }
 }

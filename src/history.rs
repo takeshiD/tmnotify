@@ -309,6 +309,19 @@ impl History {
         self.submit(|reply| Command::Clear(filter, all_servers, reply))
     }
 
+    /// Counts the exact rows a subsequent Clear would delete. This supports
+    /// confirmation without beginning a destructive transaction.
+    pub fn count_clear(
+        &self,
+        filter: ClearFilter,
+        all_servers: bool,
+    ) -> Result<HistoryTask<u64>, HistoryError> {
+        if !self.enabled {
+            return Ok(ready(Ok(0)));
+        }
+        self.submit(|reply| Command::CountClear(filter, all_servers, reply))
+    }
+
     /// Acts as the shutdown durability barrier. The worker processes commands
     /// serially, so completion means all earlier writes have reached SQLite.
     pub fn flush(&self) -> Result<HistoryTask<()>, HistoryError> {
@@ -367,6 +380,11 @@ enum Command {
         bool,
         oneshot::Sender<Result<u64, HistoryError>>,
     ),
+    CountClear(
+        ClearFilter,
+        bool,
+        oneshot::Sender<Result<u64, HistoryError>>,
+    ),
     Flush(oneshot::Sender<Result<(), HistoryError>>),
 }
 
@@ -404,11 +422,64 @@ fn worker_loop(
                     all_servers,
                 ));
             }
+            Command::CountClear(filter, all_servers, reply) => {
+                let _ = reply.send(count_clear_entries(
+                    &connection,
+                    &current_server,
+                    filter,
+                    all_servers,
+                ));
+            }
             Command::Flush(reply) => {
                 let _ = reply.send(Ok(()));
             }
         }
     }
+}
+
+fn count_clear_entries(
+    connection: &Connection,
+    current_server: &TmuxServerId,
+    filter: ClearFilter,
+    all_servers: bool,
+) -> Result<u64, HistoryError> {
+    let (sql, first, server) = match (&filter, all_servers) {
+        (ClearFilter::Hidden, true) => (
+            "SELECT count(*) FROM notifications WHERE hidden_at IS NOT NULL",
+            None,
+            None,
+        ),
+        (ClearFilter::Hidden, false) => (
+            "SELECT count(*) FROM notifications WHERE hidden_at IS NOT NULL AND tmux_server_id = ?1",
+            None,
+            Some(current_server.as_str()),
+        ),
+        (ClearFilter::Before(before), true) => (
+            "SELECT count(*) FROM notifications WHERE updated_at < ?1",
+            Some(before.timestamp_millis()),
+            None,
+        ),
+        (ClearFilter::Before(before), false) => (
+            "SELECT count(*) FROM notifications WHERE updated_at < ?1 AND tmux_server_id = ?2",
+            Some(before.timestamp_millis()),
+            Some(current_server.as_str()),
+        ),
+        (ClearFilter::All, true) => ("SELECT count(*) FROM notifications", None, None),
+        (ClearFilter::All, false) => (
+            "SELECT count(*) FROM notifications WHERE tmux_server_id = ?1",
+            None,
+            Some(current_server.as_str()),
+        ),
+    };
+    let count: i64 = match (first, server) {
+        (None, None) => connection.query_row(sql, [], |row| row.get(0))?,
+        (None, Some(server)) => connection.query_row(sql, [server], |row| row.get(0))?,
+        (Some(first), None) => connection.query_row(sql, [first], |row| row.get(0))?,
+        (Some(first), Some(server)) => {
+            connection.query_row(sql, params![first, server], |row| row.get(0))?
+        }
+    };
+    Ok(u64::try_from(count).unwrap_or(0))
 }
 
 fn clear_entries(
@@ -1395,6 +1466,24 @@ mod tests {
             .await
             .unwrap();
 
+        assert_eq!(
+            alpha
+                .count_clear(ClearFilter::Hidden, false)
+                .unwrap()
+                .wait()
+                .await
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            alpha
+                .count_clear(ClearFilter::All, true)
+                .unwrap()
+                .wait()
+                .await
+                .unwrap(),
+            3
+        );
         assert_eq!(
             alpha
                 .clear(ClearFilter::Hidden, false)

@@ -135,6 +135,18 @@ pub(super) fn run_tmux(socket_path: &Path, arguments: &[&str]) -> std::io::Resul
     )
 }
 
+pub(super) fn run_tmux_named(socket_name: &str, arguments: &[&str]) -> std::io::Result<String> {
+    if socket_name.is_empty() || socket_name.contains(['\0', '\n', '\r']) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "invalid tmux socket name",
+        ));
+    }
+    let mut command = Command::new("tmux");
+    command.arg("-L").arg(socket_name).args(arguments);
+    checked_utf8(command.output()?)
+}
+
 fn checked_utf8(output: Output) -> std::io::Result<String> {
     if !output.status.success() {
         return Err(std::io::Error::other(
