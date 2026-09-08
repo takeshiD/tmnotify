@@ -12,6 +12,7 @@ pub mod platform;
 pub mod protocol;
 pub mod providers;
 pub mod render;
+pub mod renderer_runtime;
 pub mod tmux;
 pub mod toast;
 pub mod ui;

@@ -57,6 +57,17 @@ impl Topology {
         }
         found.then_some(WindowSize { width, height })
     }
+
+    /// Best-effort actor for an action received from a shared Attention
+    /// Window, as required by ADR-0002.
+    #[must_use]
+    pub fn likely_client_for_window(&self, window_id: &WindowId) -> Option<&str> {
+        self.clients
+            .iter()
+            .filter(|client| !client.is_control && client.window_id == *window_id)
+            .max_by_key(|client| client.last_activity)
+            .map(|client| client.name.as_str())
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -188,6 +199,10 @@ mod tests {
 
         assert_eq!(topology.eligible_windows(), [WindowId("@1".into())].into());
         assert!(topology.panes[&PaneId("%8".into())].is_floating);
+        assert_eq!(
+            topology.likely_client_for_window(&WindowId("@1".into())),
+            Some("client-b")
+        );
         assert_eq!(
             topology.window_size(&WindowId("@1".into())),
             Some(WindowSize {

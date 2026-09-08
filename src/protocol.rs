@@ -471,6 +471,23 @@ pub struct RendererRedemption {
 }
 
 impl RendererRedemption {
+    pub fn new(
+        window_display_id: impl Into<String>,
+        token: impl Into<String>,
+    ) -> Result<Self, ProtocolError> {
+        let window_display_id = window_display_id.into();
+        let token = token.into();
+        let value = serde_json::json!({
+            "version": PROTOCOL_VERSION,
+            "request_id": Uuid::now_v7(),
+            "type": "renderer-redeem",
+            "window_display": window_display_id,
+            "token": token,
+        });
+        let encoded = serde_json::to_vec(&value).map_err(ProtocolError::Encode)?;
+        RequestEnvelope::decode(&encoded)?.renderer_redemption()
+    }
+
     #[must_use]
     pub fn window_display_id(&self) -> &str {
         &self.window_display_id
@@ -479,6 +496,24 @@ impl RendererRedemption {
     #[must_use]
     pub fn token(&self) -> &str {
         &self.token
+    }
+
+    pub fn encode_line(&self) -> Result<Vec<u8>, ProtocolError> {
+        let mut encoded = serde_json::to_vec(&serde_json::json!({
+            "version": PROTOCOL_VERSION,
+            "request_id": Uuid::now_v7(),
+            "type": "renderer-redeem",
+            "window_display": self.window_display_id,
+            "token": self.token,
+        }))
+        .map_err(ProtocolError::Encode)?;
+        if encoded.len() > MAX_REQUEST_BYTES {
+            return Err(ProtocolError::FrameTooLarge {
+                limit: MAX_REQUEST_BYTES,
+            });
+        }
+        encoded.push(b'\n');
+        Ok(encoded)
     }
 }
 
@@ -842,13 +877,80 @@ pub enum RendererTermination {
     ServerEnded,
 }
 
+/// Input accepted only after a renderer has redeemed its one-time credential.
+/// The Window Display identity is supplied by the authenticated connection,
+/// never by this frame, so an action cannot be redirected to another display.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum RendererAction {
+    Jump,
+    Dismiss,
+}
+
+#[derive(Serialize, Deserialize)]
+struct RendererActionWireFrame {
+    version: u16,
+    #[serde(rename = "type")]
+    frame_type: String,
+    action: RendererAction,
+}
+
+impl RendererAction {
+    pub fn encode_line(self) -> Result<Vec<u8>, ProtocolError> {
+        let mut encoded = serde_json::to_vec(&RendererActionWireFrame {
+            version: PROTOCOL_VERSION,
+            frame_type: "renderer-action".to_owned(),
+            action: self,
+        })
+        .map_err(ProtocolError::Encode)?;
+        if encoded.len() > MAX_REQUEST_BYTES {
+            return Err(ProtocolError::FrameTooLarge {
+                limit: MAX_REQUEST_BYTES,
+            });
+        }
+        encoded.push(b'\n');
+        Ok(encoded)
+    }
+
+    pub fn decode(frame: &[u8]) -> Result<Self, ProtocolError> {
+        let frame = frame.strip_suffix(b"\n").unwrap_or(frame);
+        if frame.len() > MAX_REQUEST_BYTES {
+            return Err(ProtocolError::FrameTooLarge {
+                limit: MAX_REQUEST_BYTES,
+            });
+        }
+        let decoded: RendererActionWireFrame =
+            serde_json::from_slice(frame).map_err(ProtocolError::MalformedJson)?;
+        if decoded.version != PROTOCOL_VERSION {
+            return Err(ProtocolError::UnsupportedVersion(u64::from(
+                decoded.version,
+            )));
+        }
+        if decoded.frame_type != "renderer-action" {
+            return Err(ProtocolError::UnexpectedRequestType);
+        }
+        Ok(decoded.action)
+    }
+}
+
 /// Frames streamed after a successful one-time credential redemption.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "kebab-case")]
 pub enum RendererMessage {
-    Initial { content: RendererContent },
-    Update { content: RendererContent },
-    Terminate { reason: RendererTermination },
+    Initial {
+        content: RendererContent,
+    },
+    Update {
+        content: RendererContent,
+    },
+    /// Nonfatal daemon-side action failure. Attention remains open and can be
+    /// retried or dismissed; Toast renderers never send actions.
+    Error {
+        message: String,
+    },
+    Terminate {
+        reason: RendererTermination,
+    },
 }
 
 #[derive(Serialize, Deserialize)]
@@ -1198,6 +1300,23 @@ mod tests {
         assert!(matches!(
             malformed.renderer_redemption(),
             Err(ProtocolError::MissingOrInvalidField("token"))
+        ));
+    }
+
+    #[test]
+    fn renderer_actions_are_bounded_and_have_no_target_selector() {
+        let encoded = RendererAction::Jump.encode_line().unwrap();
+        assert_eq!(
+            RendererAction::decode(&encoded).unwrap(),
+            RendererAction::Jump
+        );
+        let value: Value = serde_json::from_slice(&encoded).unwrap();
+        assert_eq!(value["type"], "renderer-action");
+        assert!(value.get("window_display").is_none());
+        assert!(value.get("token").is_none());
+        assert!(matches!(
+            RendererAction::decode(br#"{"version":1,"type":"other","action":"jump"}"#),
+            Err(ProtocolError::UnexpectedRequestType)
         ));
     }
 

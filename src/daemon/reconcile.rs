@@ -6,6 +6,7 @@ use chrono::{DateTime, Utc};
 
 use super::{DisplayPlan as SchedulerDisplayPlan, LiveScheduler, MonotonicTime, SchedulerError};
 use crate::notification::NotificationId;
+use crate::protocol::RendererContent;
 use crate::tmux::{
     Backend, DisplayKind, DisplayPlan, Event, Geometry, PlannedDisplay, ReconcileReport, Topology,
     WindowId, WindowSize,
@@ -223,7 +224,7 @@ impl WindowReconciler {
             self.dirty = true;
         }
 
-        let desired = self.build_plan(&scheduler_plan, &eligible);
+        let desired = self.build_plan(scheduler, &scheduler_plan, &eligible);
         let retry_due = self
             .retries
             .values()
@@ -286,6 +287,7 @@ impl WindowReconciler {
 
     fn build_plan(
         &mut self,
+        scheduler: &LiveScheduler,
         scheduler_plan: &SchedulerDisplayPlan,
         eligible: &BTreeSet<WindowId>,
     ) -> DisplayPlan {
@@ -300,9 +302,21 @@ impl WindowReconciler {
                 height: 24,
             });
             let displays = if let Some(id) = scheduler_plan.attention {
-                vec![self.planned_attention(window, id, size, initial_ids.contains(&id))]
+                vec![self.planned_attention(
+                    window,
+                    id,
+                    size,
+                    initial_ids.contains(&id),
+                    renderer_content(scheduler, id),
+                )]
             } else {
-                self.planned_toasts(window, &scheduler_plan.toasts, size, &initial_ids)
+                self.planned_toasts(
+                    scheduler,
+                    window,
+                    &scheduler_plan.toasts,
+                    size,
+                    &initial_ids,
+                )
             };
             plan.windows.insert(window.clone(), displays);
         }
@@ -317,6 +331,7 @@ impl WindowReconciler {
         id: NotificationId,
         size: WindowSize,
         play_enter_animation: bool,
+        content: RendererContent,
     ) -> PlannedDisplay {
         let width = if size.width >= 60 {
             ((u32::from(size.width) * 60) / 100).max(32) as u16
@@ -334,12 +349,14 @@ impl WindowReconciler {
                 height,
                 z_index: 100,
             },
+            content,
             play_enter_animation,
         }
     }
 
     fn planned_toasts(
         &self,
+        scheduler: &LiveScheduler,
         window: &WindowId,
         ids: &[NotificationId],
         size: WindowSize,
@@ -371,6 +388,7 @@ impl WindowReconciler {
                     height,
                     z_index: u16::try_from(index).unwrap_or(u16::MAX),
                 },
+                content: renderer_content(scheduler, *id),
                 play_enter_animation: initial_ids.contains(id),
             })
             .collect()
@@ -461,6 +479,14 @@ impl WindowReconciler {
             next_wakeup,
         }
     }
+}
+
+fn renderer_content(scheduler: &LiveScheduler, id: NotificationId) -> RendererContent {
+    RendererContent::from(
+        scheduler
+            .notification(id)
+            .expect("display plan IDs must refer to live Notifications"),
+    )
 }
 
 fn display_id(id: NotificationId, window: &WindowId) -> String {

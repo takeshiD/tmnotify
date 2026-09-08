@@ -13,6 +13,7 @@ use thiserror::Error;
 
 use super::{InterruptWatcher, TerminalSession};
 use crate::notification::{Notification, Presentation};
+use crate::protocol::RendererContent;
 
 pub const COMPACT_MIN_WIDTH: u16 = 32;
 pub const COMPACT_MIN_HEIGHT: u16 = 7;
@@ -55,6 +56,30 @@ impl AttentionState {
         Ok(Self {
             title: notification.title().to_owned(),
             body: notification.body().to_owned(),
+            source,
+            error: None,
+            unicode,
+            color,
+        })
+    }
+
+    pub fn from_renderer_content(
+        content: &RendererContent,
+        unicode: bool,
+        color: bool,
+    ) -> Result<Self, AttentionError> {
+        if content.presentation() != Presentation::Attention {
+            return Err(AttentionError::NotAttention);
+        }
+        let source = content.source().map(|source| {
+            source.cwd().map_or_else(
+                || source.pane_id().to_owned(),
+                |cwd| format!("{} · {cwd}", source.pane_id()),
+            )
+        });
+        Ok(Self {
+            title: content.title().to_owned(),
+            body: content.body().to_owned(),
             source,
             error: None,
             unicode,

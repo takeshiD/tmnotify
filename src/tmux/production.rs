@@ -2,7 +2,10 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
-use std::sync::mpsc::{self, Receiver, RecvTimeoutError, TryRecvError};
+use std::sync::{
+    Arc, Mutex,
+    mpsc::{self, Receiver, RecvTimeoutError, TryRecvError},
+};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -32,7 +35,7 @@ pub struct ProductionBackend {
     executable: PathBuf,
     connection: Option<ControlConnection>,
     displays: BTreeMap<String, ActualDisplay>,
-    renderers: RendererSessions,
+    renderers: Arc<Mutex<RendererSessions>>,
     refresh_interval: Duration,
     next_refresh: Instant,
 }
@@ -43,6 +46,7 @@ struct ActualDisplay {
     window_id: WindowId,
     kind: DisplayKind,
     geometry: Geometry,
+    content: crate::protocol::RendererContent,
 }
 
 impl ProductionBackend {
@@ -79,7 +83,7 @@ impl ProductionBackend {
             executable,
             connection: Some(connection),
             displays: BTreeMap::new(),
-            renderers,
+            renderers: Arc::new(Mutex::new(renderers)),
             refresh_interval,
             next_refresh: Instant::now() + refresh_interval,
         })
@@ -88,8 +92,8 @@ impl ProductionBackend {
     /// Gives the daemon renderer broker access to the credentials owned by
     /// this backend. The broker still streams content over its private socket;
     /// tmux only receives the opaque launch ID and token.
-    pub fn renderer_sessions(&mut self) -> &mut RendererSessions {
-        &mut self.renderers
+    pub fn renderer_sessions(&self) -> Arc<Mutex<RendererSessions>> {
+        Arc::clone(&self.renderers)
     }
 
     fn ensure_connection(&mut self) -> Result<&mut ControlConnection, Error> {
@@ -178,7 +182,9 @@ impl ProductionBackend {
             .map_err(|error| Error::Protocol(error.to_string()))?;
         let launch = self
             .renderers
-            .create(display_id.clone(), Instant::now())
+            .lock()
+            .map_err(|_| Error::Protocol("renderer session lock is poisoned".into()))?
+            .create(display_id.clone(), desired.content.clone(), Instant::now())
             .map_err(session_error)?;
         let renderer_mode = match desired.kind {
             DisplayKind::Toast => "__render-toast",
@@ -196,9 +202,7 @@ impl ProductionBackend {
         let renderer_argv = match self.renderer_argv(renderer_mode, &launch) {
             Ok(arguments) => arguments,
             Err(error) => {
-                let _ = self
-                    .renderers
-                    .terminate(&display_id, RendererTermination::RenderFailed);
+                self.terminate_renderer(&display_id, RendererTermination::RenderFailed);
                 return Err(error);
             }
         };
@@ -206,16 +210,12 @@ impl ProductionBackend {
         let result = match self.command(&[create]) {
             Ok(result) => result,
             Err(error) => {
-                let _ = self
-                    .renderers
-                    .terminate(&display_id, RendererTermination::RenderFailed);
+                self.terminate_renderer(&display_id, RendererTermination::RenderFailed);
                 return Err(error);
             }
         };
         if let Err(error) = require_success(&result) {
-            let _ = self
-                .renderers
-                .terminate(&display_id, RendererTermination::RenderFailed);
+            self.terminate_renderer(&display_id, RendererTermination::RenderFailed);
             return Err(error);
         }
         let pane = result
@@ -225,9 +225,7 @@ impl ProductionBackend {
             .find(|line| validate_stable_id(line, '%').is_ok())
             .cloned();
         let Some(pane) = pane else {
-            let _ = self
-                .renderers
-                .terminate(&display_id, RendererTermination::RenderFailed);
+            self.terminate_renderer(&display_id, RendererTermination::RenderFailed);
             return Err(Error::Protocol(
                 "split-window did not return a pane ID".into(),
             ));
@@ -241,17 +239,13 @@ impl ProductionBackend {
             Ok(result) => result,
             Err(error) => {
                 let _ = self.command(&[vec!["kill-pane".into(), "-t".into(), pane_id.0.clone()]]);
-                let _ = self
-                    .renderers
-                    .terminate(&display_id, RendererTermination::RenderFailed);
+                self.terminate_renderer(&display_id, RendererTermination::RenderFailed);
                 return Err(error);
             }
         };
         if let Err(error) = require_success(&result) {
             let _ = self.command(&[vec!["kill-pane".into(), "-t".into(), pane_id.0.clone()]]);
-            let _ = self
-                .renderers
-                .terminate(&display_id, RendererTermination::RenderFailed);
+            self.terminate_renderer(&display_id, RendererTermination::RenderFailed);
             return Err(error);
         }
         self.displays.insert(
@@ -261,6 +255,7 @@ impl ProductionBackend {
                 window_id: window.clone(),
                 kind: desired.kind,
                 geometry: desired.geometry,
+                content: desired.content.clone(),
             },
         );
         Ok(())
@@ -329,6 +324,20 @@ impl ProductionBackend {
                 .expect("updated display remains registered")
                 .geometry = desired.geometry;
         }
+        if actual.content != desired.content {
+            self.renderers
+                .lock()
+                .map_err(|_| Error::Protocol("renderer session lock is poisoned".into()))?
+                .update(
+                    &WindowDisplayId::new(id.to_owned()).map_err(session_error)?,
+                    desired.content.clone(),
+                )
+                .map_err(session_error)?;
+            self.displays
+                .get_mut(id)
+                .expect("updated display remains registered")
+                .content = desired.content.clone();
+        }
         Ok(())
     }
 
@@ -354,7 +363,7 @@ impl ProductionBackend {
             if self.displays.remove(id).is_some() {
                 let display_id = WindowDisplayId::new(id.clone())
                     .map_err(|error| Error::Protocol(error.to_string()))?;
-                let _ = self.renderers.terminate(&display_id, reason);
+                self.terminate_renderer(&display_id, reason);
             }
         }
         Ok(())
@@ -370,9 +379,7 @@ impl ProductionBackend {
         for id in missing {
             self.displays.remove(&id);
             if let Ok(display_id) = WindowDisplayId::new(id) {
-                let _ = self
-                    .renderers
-                    .terminate(&display_id, RendererTermination::RenderFailed);
+                self.terminate_renderer(&display_id, RendererTermination::RenderFailed);
             }
         }
     }
@@ -385,6 +392,12 @@ impl ProductionBackend {
             .map(|(id, _)| id.clone())
             .collect::<Vec<_>>();
         self.close_displays(&ids, RendererTermination::Jumped)
+    }
+
+    fn terminate_renderer(&self, id: &WindowDisplayId, reason: RendererTermination) {
+        if let Ok(mut sessions) = self.renderers.lock() {
+            let _ = sessions.terminate(id, reason);
+        }
     }
 }
 
@@ -833,6 +846,14 @@ fn jump_commands(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::notification::{Notification, NotificationDraft, Presentation};
+    use crate::protocol::RendererMessage;
+    use chrono::Utc;
+
+    fn content() -> crate::protocol::RendererContent {
+        let draft = NotificationDraft::new(Presentation::Toast, "test", "body", None).unwrap();
+        crate::protocol::RendererContent::from(&Notification::from_draft(draft, Utc::now()))
+    }
 
     fn geometry(x: u16, y: u16, width: u16, height: u16, z_index: u16) -> Geometry {
         Geometry {
@@ -863,13 +884,15 @@ mod tests {
     fn renderer_command_is_direct_argv_with_only_executable_id_and_token() {
         let display = WindowDisplayId::new("display-1").unwrap();
         let mut sessions = RendererSessions::new(SessionLimits::default()).unwrap();
-        let launch = sessions.create(display, Instant::now()).unwrap();
+        let launch = sessions.create(display, content(), Instant::now()).unwrap();
         let backend = ProductionBackend {
             server: Server::new("/tmp/not-connected"),
             executable: PathBuf::from("/tmp/tm notify's binary"),
             connection: None,
             displays: BTreeMap::new(),
-            renderers: RendererSessions::new(SessionLimits::default()).unwrap(),
+            renderers: Arc::new(Mutex::new(
+                RendererSessions::new(SessionLimits::default()).unwrap(),
+            )),
             refresh_interval: DEFAULT_TOPOLOGY_REFRESH_INTERVAL,
             next_refresh: Instant::now() + DEFAULT_TOPOLOGY_REFRESH_INTERVAL,
         };
@@ -884,6 +907,68 @@ mod tests {
                 launch.token().expose_secret(),
             ]
         );
+    }
+
+    #[test]
+    fn content_changes_stream_without_recreating_or_using_tmux_commands() {
+        let old = content();
+        let new_draft =
+            NotificationDraft::new(Presentation::Toast, "updated", "new", None).unwrap();
+        let new = crate::protocol::RendererContent::from(&Notification::from_draft(
+            new_draft,
+            Utc::now(),
+        ));
+        let sessions = Arc::new(Mutex::new(
+            RendererSessions::new(SessionLimits::default()).unwrap(),
+        ));
+        let display_id = WindowDisplayId::new("display-1").unwrap();
+        let launch = sessions
+            .lock()
+            .unwrap()
+            .create(display_id.clone(), old.clone(), Instant::now())
+            .unwrap();
+        let stream = sessions
+            .lock()
+            .unwrap()
+            .redeem(&display_id, launch.token().expose_secret(), Instant::now())
+            .unwrap();
+        let actual = ActualDisplay {
+            pane_id: PaneId("%1".into()),
+            window_id: WindowId("@1".into()),
+            kind: DisplayKind::Toast,
+            geometry: geometry(0, 0, 42, 3, 0),
+            content: old,
+        };
+        let mut backend = ProductionBackend {
+            server: Server::new("/tmp/not-connected"),
+            executable: PathBuf::from("/tmp/tmnotify"),
+            connection: None,
+            displays: [("display-1".to_owned(), actual.clone())].into(),
+            renderers: sessions,
+            refresh_interval: DEFAULT_TOPOLOGY_REFRESH_INTERVAL,
+            next_refresh: Instant::now() + DEFAULT_TOPOLOGY_REFRESH_INTERVAL,
+        };
+        backend
+            .update_display(
+                "display-1",
+                &actual,
+                &PlannedDisplay {
+                    display_id: "display-1".into(),
+                    kind: DisplayKind::Toast,
+                    geometry: actual.geometry,
+                    content: new,
+                    play_enter_animation: false,
+                },
+            )
+            .unwrap();
+        assert!(matches!(
+            stream.recv().unwrap(),
+            RendererMessage::Initial { .. }
+        ));
+        assert!(matches!(
+            stream.recv().unwrap(),
+            RendererMessage::Update { content } if content.title() == "updated"
+        ));
     }
 
     #[test]
@@ -1010,6 +1095,7 @@ mod tests {
                 display_id: "display-1".into(),
                 kind: DisplayKind::Toast,
                 geometry: geometry(3, 2, 32, 7, 0),
+                content: content(),
                 play_enter_animation: true,
             }],
         );

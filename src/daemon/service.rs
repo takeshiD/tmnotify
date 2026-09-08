@@ -16,10 +16,12 @@ use tokio::sync::Mutex;
 
 use super::{LiveScheduler, MonotonicTime, SchedulerError, SubmitDisposition, UpdateDisposition};
 use crate::history::{ClearFilter, History, HistoryError, HistoryQuery, PersistenceStatus};
-use crate::notification::{Notification, NotificationId, NotificationKey, SourceContext};
+use crate::notification::{
+    Notification, NotificationId, NotificationKey, Presentation, SourceContext,
+};
 use crate::protocol::{
-    ClientCommand, ClientRequest, Disposition, ProtocolError, RequestEnvelope, TargetSelector,
-    WireHistoryClear,
+    ClientCommand, ClientRequest, Disposition, ProtocolError, RendererAction, RequestEnvelope,
+    TargetSelector, WireHistoryClear,
 };
 
 pub trait JumpExecutor: Send + Sync + 'static {
@@ -27,6 +29,16 @@ pub trait JumpExecutor: Send + Sync + 'static {
         &self,
         source: SourceContext,
     ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + '_>>;
+
+    /// Attention actions include the authenticated Attention Window so a tmux
+    /// executor can select the most recently active client viewing it.
+    fn jump_from_attention(
+        &self,
+        source: SourceContext,
+        _attention_window: String,
+    ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + '_>> {
+        self.jump(source)
+    }
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -265,6 +277,84 @@ impl<J: JumpExecutor> DaemonService<J> {
             }
         }
     }
+
+    /// Resolves an action from an already-authenticated renderer connection.
+    /// The display ID is `<notification UUID>:<stable window ID>`; there is no
+    /// caller-supplied selector that could target a different Notification.
+    pub async fn handle_renderer_action(
+        &self,
+        window_display_id: &str,
+        action: RendererAction,
+        monotonic_now: MonotonicTime,
+        wall_now: DateTime<Utc>,
+    ) -> Result<(), ServiceError> {
+        let (notification, attention_window) = parse_window_display_id(window_display_id)?;
+        {
+            let scheduler = self.scheduler.lock().await;
+            let live = scheduler
+                .notification(notification)
+                .ok_or(SchedulerError::NotificationNotLive)?;
+            if live.presentation() != Presentation::Attention {
+                return Err(ServiceError::RendererActionNotAttention);
+            }
+        }
+
+        match action {
+            RendererAction::Dismiss => {
+                let snapshots = {
+                    let mut scheduler = self.scheduler.lock().await;
+                    scheduler.dismiss(notification, monotonic_now, wall_now)?;
+                    scheduler.drain_closed()
+                };
+                let _ = persist_snapshots(&self.history, snapshots).await;
+                Ok(())
+            }
+            RendererAction::Jump => {
+                let intent = self.scheduler.lock().await.begin_jump(
+                    notification,
+                    monotonic_now,
+                    wall_now,
+                )?;
+                match self
+                    .jump
+                    .jump_from_attention(intent.source().clone(), attention_window)
+                    .await
+                {
+                    Ok(()) => {
+                        let snapshots = {
+                            let mut scheduler = self.scheduler.lock().await;
+                            scheduler.commit_jump(intent, monotonic_now, wall_now)?;
+                            scheduler.drain_closed()
+                        };
+                        let _ = persist_snapshots(&self.history, snapshots).await;
+                        Ok(())
+                    }
+                    Err(error) => {
+                        self.scheduler
+                            .lock()
+                            .await
+                            .cancel_jump(intent, monotonic_now, wall_now)?;
+                        Err(ServiceError::Jump(error))
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn parse_window_display_id(value: &str) -> Result<(NotificationId, String), ServiceError> {
+    let (notification, window) = value
+        .split_once(':')
+        .ok_or(ServiceError::InvalidWindowDisplay)?;
+    let notification = notification
+        .parse()
+        .map_err(|_| ServiceError::InvalidWindowDisplay)?;
+    if !window.strip_prefix('@').is_some_and(|suffix| {
+        !suffix.is_empty() && suffix.bytes().all(|byte| byte.is_ascii_digit())
+    }) {
+        return Err(ServiceError::InvalidWindowDisplay);
+    }
+    Ok((notification, window.to_owned()))
 }
 
 async fn persist_snapshots(history: &History, snapshots: Vec<Notification>) -> bool {
@@ -305,6 +395,10 @@ pub enum ServiceError {
     Jump(String),
     #[error("History clear timestamp is invalid")]
     InvalidClearTimestamp,
+    #[error("invalid authenticated Window Display ID")]
+    InvalidWindowDisplay,
+    #[error("renderer actions are valid only for an Attention Gate")]
+    RendererActionNotAttention,
 }
 
 #[cfg(test)]
@@ -323,6 +417,7 @@ mod tests {
     struct FakeJump {
         fail: bool,
         sources: StdMutex<Vec<SourceContext>>,
+        attention_windows: StdMutex<Vec<String>>,
     }
 
     impl JumpExecutor for FakeJump {
@@ -337,6 +432,18 @@ mod tests {
                 Ok(())
             };
             Box::pin(async move { result })
+        }
+
+        fn jump_from_attention(
+            &self,
+            source: SourceContext,
+            attention_window: String,
+        ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + '_>> {
+            self.attention_windows
+                .lock()
+                .unwrap()
+                .push(attention_window);
+            self.jump(source)
         }
     }
 
@@ -379,6 +486,72 @@ mod tests {
         ClientCommand::Send {
             notification: Box::new(WireNotificationDraft::from_domain(&draft)),
         }
+    }
+
+    fn attention_send() -> ClientCommand {
+        let draft = NotificationDraft::new(
+            Presentation::Attention,
+            "input needed",
+            "review source",
+            Some(source()),
+        )
+        .unwrap();
+        ClientCommand::Send {
+            notification: Box::new(WireNotificationDraft::from_domain(&draft)),
+        }
+    }
+
+    #[tokio::test]
+    async fn authenticated_attention_action_uses_display_window_and_closes_globally() {
+        let temporary = TempDir::new().unwrap();
+        let service = service(&temporary, FakeJump::default());
+        let (mono, wall) = times();
+        let sent = service.handle(attention_send(), mono, wall).await.unwrap();
+        let display = format!("{}:@7", sent.notification_id.unwrap());
+        service
+            .handle_renderer_action(&display, RendererAction::Jump, mono, wall)
+            .await
+            .unwrap();
+        assert_eq!(
+            service.jump.attention_windows.lock().unwrap().as_slice(),
+            &["@7"]
+        );
+        assert!(
+            service
+                .scheduler
+                .lock()
+                .await
+                .notification(sent.notification_id.unwrap())
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn renderer_action_rejects_toast_and_bad_display_identity() {
+        let temporary = TempDir::new().unwrap();
+        let service = service(&temporary, FakeJump::default());
+        let (mono, wall) = times();
+        let sent = service
+            .handle(keyed_send("build"), mono, wall)
+            .await
+            .unwrap();
+        assert!(matches!(
+            service
+                .handle_renderer_action(
+                    &format!("{}:@1", sent.notification_id.unwrap()),
+                    RendererAction::Dismiss,
+                    mono,
+                    wall,
+                )
+                .await,
+            Err(ServiceError::RendererActionNotAttention)
+        ));
+        assert!(matches!(
+            service
+                .handle_renderer_action("not-a-display", RendererAction::Jump, mono, wall)
+                .await,
+            Err(ServiceError::InvalidWindowDisplay)
+        ));
     }
 
     #[tokio::test]

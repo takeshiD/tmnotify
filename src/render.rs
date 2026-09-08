@@ -133,6 +133,30 @@ pub enum RendererOutcome {
     },
 }
 
+/// Authenticated stream identity retained by the daemon socket task. The
+/// generation is not sent to the renderer; it prevents an old connection from
+/// acting after the same Window Display has been recreated.
+pub struct RendererStream {
+    generation: u64,
+    receiver: Receiver<RendererMessage>,
+}
+
+impl RendererStream {
+    #[must_use]
+    pub fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    pub fn recv(&self) -> Result<RendererMessage, mpsc::RecvError> {
+        self.receiver.recv()
+    }
+
+    #[must_use]
+    pub fn into_receiver(self) -> Receiver<RendererMessage> {
+        self.receiver
+    }
+}
+
 #[derive(Debug, Error, Eq, PartialEq)]
 pub enum SessionError {
     #[error("invalid Window Display ID")]
@@ -178,6 +202,7 @@ struct DisplaySession {
     generation: u64,
     pending_token: Option<String>,
     sender: Option<SyncSender<RendererMessage>>,
+    content: RendererContent,
 }
 
 pub struct RendererSessions<G = OsTokenGenerator> {
@@ -217,6 +242,7 @@ impl<G: TokenGenerator> RendererSessions<G> {
     pub fn create(
         &mut self,
         window_display_id: WindowDisplayId,
+        content: RendererContent,
         now: Instant,
     ) -> Result<RendererLaunch, SessionError> {
         self.expire_credentials(now);
@@ -252,6 +278,7 @@ impl<G: TokenGenerator> RendererSessions<G> {
                 generation,
                 pending_token: Some(token.clone()),
                 sender: None,
+                content,
             },
         );
         Ok(RendererLaunch {
@@ -267,9 +294,8 @@ impl<G: TokenGenerator> RendererSessions<G> {
         &mut self,
         window_display_id: &WindowDisplayId,
         token: &str,
-        initial: RendererContent,
         now: Instant,
-    ) -> Result<Receiver<RendererMessage>, SessionError> {
+    ) -> Result<RendererStream, SessionError> {
         self.expire_credentials(now);
         let Some(credential) = self.credentials.get(token).cloned() else {
             return Err(self.retired_error(window_display_id, token));
@@ -288,7 +314,9 @@ impl<G: TokenGenerator> RendererSessions<G> {
 
         let (sender, receiver) = mpsc::sync_channel(self.limits.channel_capacity);
         sender
-            .try_send(RendererMessage::Initial { content: initial })
+            .try_send(RendererMessage::Initial {
+                content: display.content.clone(),
+            })
             .map_err(|_| SessionError::ChannelFull)?;
         display.pending_token = None;
         display.sender = Some(sender);
@@ -298,7 +326,10 @@ impl<G: TokenGenerator> RendererSessions<G> {
             window_display_id.clone(),
             RetiredReason::Consumed,
         );
-        Ok(receiver)
+        Ok(RendererStream {
+            generation: credential.generation,
+            receiver,
+        })
     }
 
     pub fn update(
@@ -306,7 +337,24 @@ impl<G: TokenGenerator> RendererSessions<G> {
         window_display_id: &WindowDisplayId,
         content: RendererContent,
     ) -> Result<(), SessionError> {
-        self.send(window_display_id, RendererMessage::Update { content })
+        let display = self
+            .displays
+            .get_mut(window_display_id)
+            .ok_or(SessionError::UnknownWindowDisplay)?;
+        display.content = content.clone();
+        let Some(sender) = display.sender.as_ref() else {
+            // A keyed update may race renderer startup. Redemption must return
+            // the newest content rather than forcing a display recreation.
+            return Ok(());
+        };
+        match sender.try_send(RendererMessage::Update { content }) {
+            Ok(()) => Ok(()),
+            Err(TrySendError::Full(_)) => Err(SessionError::ChannelFull),
+            Err(TrySendError::Disconnected(_)) => {
+                display.sender = None;
+                Err(SessionError::RendererDisconnected)
+            }
+        }
     }
 
     pub fn terminate(
@@ -367,27 +415,15 @@ impl<G: TokenGenerator> RendererSessions<G> {
         self.displays.is_empty()
     }
 
-    fn send(
-        &mut self,
+    #[must_use]
+    pub fn is_current_generation(
+        &self,
         window_display_id: &WindowDisplayId,
-        message: RendererMessage,
-    ) -> Result<(), SessionError> {
-        let display = self
-            .displays
-            .get_mut(window_display_id)
-            .ok_or(SessionError::UnknownWindowDisplay)?;
-        let sender = display
-            .sender
-            .as_ref()
-            .ok_or(SessionError::RendererDisconnected)?;
-        match sender.try_send(message) {
-            Ok(()) => Ok(()),
-            Err(TrySendError::Full(_)) => Err(SessionError::ChannelFull),
-            Err(TrySendError::Disconnected(_)) => {
-                display.sender = None;
-                Err(SessionError::RendererDisconnected)
-            }
-        }
+        generation: u64,
+    ) -> bool {
+        self.displays
+            .get(window_display_id)
+            .is_some_and(|display| display.generation == generation)
     }
 
     fn unique_token(&mut self) -> Result<String, SessionError> {
@@ -508,7 +544,9 @@ mod tests {
     #[test]
     fn token_is_cryptographic_length_and_debug_is_redacted() {
         let now = Instant::now();
-        let launch = manager(1, 2).create(id("display-1"), now).unwrap();
+        let launch = manager(1, 2)
+            .create(id("display-1"), content("initial"), now)
+            .unwrap();
         assert_eq!(launch.token().expose_secret().len(), TOKEN_BYTES * 2);
         assert_eq!(format!("{:?}", launch.token()), "RendererToken([REDACTED])");
         assert!(!format!("{launch:?}").contains(launch.token().expose_secret()));
@@ -519,14 +557,11 @@ mod tests {
         let now = Instant::now();
         let display_id = id("display-1");
         let mut sessions = manager(1, 4);
-        let launch = sessions.create(display_id.clone(), now).unwrap();
+        let launch = sessions
+            .create(display_id.clone(), content("initial"), now)
+            .unwrap();
         let stream = sessions
-            .redeem(
-                &display_id,
-                launch.token().expose_secret(),
-                content("initial"),
-                now,
-            )
+            .redeem(&display_id, launch.token().expose_secret(), now)
             .unwrap();
         sessions.update(&display_id, content("updated")).unwrap();
         sessions
@@ -550,60 +585,65 @@ mod tests {
     }
 
     #[test]
+    fn update_before_redemption_becomes_the_initial_frame() {
+        let now = Instant::now();
+        let display_id = id("display-1");
+        let mut sessions = manager(1, 2);
+        let launch = sessions
+            .create(display_id.clone(), content("old"), now)
+            .unwrap();
+        sessions.update(&display_id, content("newest")).unwrap();
+        let stream = sessions
+            .redeem(&display_id, launch.token().expose_secret(), now)
+            .unwrap();
+        assert!(matches!(
+            stream.recv().unwrap(),
+            RendererMessage::Initial { content } if content.body() == "newest"
+        ));
+    }
+
+    #[test]
     fn rejects_mismatch_duplicate_expiry_and_recreation_staleness() {
         let now = Instant::now();
         let first_id = id("display-1");
         let other_id = id("display-2");
         let mut sessions = manager(2, 2);
-        let first = sessions.create(first_id.clone(), now).unwrap();
+        let first = sessions
+            .create(first_id.clone(), content("secret"), now)
+            .unwrap();
         assert!(matches!(
-            sessions.redeem(
-                &other_id,
-                first.token().expose_secret(),
-                content("secret"),
-                now
-            ),
+            sessions.redeem(&other_id, first.token().expose_secret(), now),
             Err(SessionError::MismatchedCredential)
         ));
         let _stream = sessions
-            .redeem(
-                &first_id,
-                first.token().expose_secret(),
-                content("secret"),
-                now,
-            )
+            .redeem(&first_id, first.token().expose_secret(), now)
             .unwrap();
         assert!(matches!(
-            sessions.redeem(
-                &first_id,
-                first.token().expose_secret(),
-                content("secret"),
-                now
-            ),
+            sessions.redeem(&first_id, first.token().expose_secret(), now),
             Err(SessionError::DuplicateRedemption)
         ));
 
-        let expiring = sessions.create(other_id.clone(), now).unwrap();
+        let expiring = sessions
+            .create(other_id.clone(), content("secret"), now)
+            .unwrap();
         assert!(matches!(
             sessions.redeem(
                 &other_id,
                 expiring.token().expose_secret(),
-                content("secret"),
                 now + Duration::from_secs(5)
             ),
             Err(SessionError::StaleCredential)
         ));
 
-        let old = sessions.create(first_id.clone(), now).unwrap();
-        let replacement = sessions.create(first_id.clone(), now).unwrap();
+        let old = sessions
+            .create(first_id.clone(), content("old"), now)
+            .unwrap();
+        let replacement = sessions
+            .create(first_id.clone(), content("replacement"), now)
+            .unwrap();
         assert_ne!(old.token(), replacement.token());
         assert!(matches!(
-            sessions.redeem(
-                &first_id,
-                old.token().expose_secret(),
-                content("secret"),
-                now
-            ),
+            sessions.redeem(&first_id, old.token().expose_secret(), now),
             Err(SessionError::StaleCredential)
         ));
     }
@@ -613,18 +653,15 @@ mod tests {
         let now = Instant::now();
         let mut sessions = manager(1, 1);
         let first_id = id("display-1");
-        let launch = sessions.create(first_id.clone(), now).unwrap();
+        let launch = sessions
+            .create(first_id.clone(), content("initial"), now)
+            .unwrap();
         assert_eq!(
-            sessions.create(id("display-2"), now),
+            sessions.create(id("display-2"), content("other"), now),
             Err(SessionError::CapacityExhausted)
         );
         let _stream = sessions
-            .redeem(
-                &first_id,
-                launch.token().expose_secret(),
-                content("initial"),
-                now,
-            )
+            .redeem(&first_id, launch.token().expose_secret(), now)
             .unwrap();
         assert_eq!(
             sessions.update(&first_id, content("blocked")),
@@ -637,8 +674,18 @@ mod tests {
         let now = Instant::now();
         let display_id = id("display-1");
         let mut sessions = manager(1, 2);
-        let old = sessions.create(display_id.clone(), now).unwrap();
-        let current = sessions.create(display_id.clone(), now).unwrap();
+        let old = sessions
+            .create(display_id.clone(), content("old"), now)
+            .unwrap();
+        let old_stream = sessions
+            .redeem(&display_id, old.token().expose_secret(), now)
+            .unwrap();
+        assert!(sessions.is_current_generation(&display_id, old_stream.generation()));
+        let current = sessions
+            .create(display_id.clone(), content("current"), now)
+            .unwrap();
+        assert!(!sessions.is_current_generation(&display_id, old_stream.generation()));
+        assert!(sessions.is_current_generation(&display_id, current.generation()));
 
         assert_eq!(
             sessions.renderer_exited(&display_id, old.generation(), RendererExit::Failed),

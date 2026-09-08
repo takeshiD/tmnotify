@@ -14,6 +14,7 @@ use std::fmt;
 use std::path::PathBuf;
 
 use crate::notification::{IngressError, SourceContext, TmuxServerId};
+use crate::protocol::RendererContent;
 
 pub use capability::{Capability, CapabilityReport, ProductionProbe, UnsupportedTmux};
 pub use production::{DEFAULT_TOPOLOGY_REFRESH_INTERVAL, ProductionBackend};
@@ -39,6 +40,9 @@ pub struct PlannedDisplay {
     pub display_id: String,
     pub kind: DisplayKind,
     pub geometry: Geometry,
+    /// Normalized content delivered only through the authenticated daemon
+    /// socket. The tmux implementation must never place it in argv or env.
+    pub content: RendererContent,
     /// Follow/retry recreations must not replay a Notification's entrance.
     pub play_enter_animation: bool,
 }
@@ -271,9 +275,30 @@ pub enum SourceCaptureError {
 
 #[cfg(test)]
 pub(crate) mod fake {
+    use crate::notification::{Notification, NotificationDraft, Presentation};
+    use chrono::Utc;
     use std::collections::VecDeque;
 
     use super::*;
+
+    fn content() -> RendererContent {
+        let draft = NotificationDraft::new(
+            Presentation::Attention,
+            "test",
+            "body",
+            Some(
+                crate::notification::SourceContext::new(
+                    crate::notification::TmuxServerId::new("server").unwrap(),
+                    "$1",
+                    "@2",
+                    "%3",
+                )
+                .unwrap(),
+            ),
+        )
+        .unwrap();
+        RendererContent::from(&Notification::from_draft(draft, Utc::now()))
+    }
 
     #[derive(Debug)]
     pub(crate) struct FakeTmux {
@@ -344,6 +369,7 @@ pub(crate) mod fake {
                     height: 9,
                     z_index: 5,
                 },
+                content: content(),
                 play_enter_animation: true,
             }],
         );

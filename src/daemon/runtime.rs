@@ -10,8 +10,9 @@ use std::io;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use std::process::Stdio;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex as StdMutex, mpsc::Receiver};
 use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
@@ -25,9 +26,10 @@ use tokio::time::{sleep, timeout};
 
 use crate::platform::{PathError, ensure_private_directory, validate_runtime_socket};
 use crate::protocol::{
-    CacheLookup, FrameDecoder, MAX_REQUEST_BYTES, PROTOCOL_VERSION, RequestEnvelope,
-    RequestResultCache,
+    CacheLookup, FrameDecoder, MAX_REQUEST_BYTES, PROTOCOL_VERSION, RendererAction,
+    RendererMessage, RequestEnvelope, RequestKind, RequestResultCache,
 };
+use crate::render::{RendererSessions, RendererStream, WindowDisplayId};
 
 const SOCKET_MODE: u32 = 0o600;
 
@@ -115,6 +117,88 @@ impl RuntimeLimits {
 pub enum RuntimeShutdown {
     Signal,
     ServerEnded,
+}
+
+/// Daemon-owned bridge for a renderer connection. Only `redeem` accepts an ID
+/// and token. Later actions inherit that authenticated ID from the connection.
+pub trait RendererBroker: Send + Sync + 'static {
+    fn redeem(&self, window_display_id: &str, token: &str) -> Result<RendererStream, String>;
+
+    fn action(
+        &self,
+        window_display_id: String,
+        generation: u64,
+        action: RendererAction,
+    ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + '_>>;
+}
+
+pub trait RendererActionExecutor: Send + Sync + 'static {
+    fn execute(
+        &self,
+        window_display_id: String,
+        action: RendererAction,
+    ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + '_>>;
+}
+
+impl<F, Fut> RendererActionExecutor for F
+where
+    F: Fn(String, RendererAction) -> Fut + Send + Sync + 'static,
+    Fut: Future<Output = Result<(), String>> + Send + 'static,
+{
+    fn execute(
+        &self,
+        window_display_id: String,
+        action: RendererAction,
+    ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + '_>> {
+        Box::pin((self)(window_display_id, action))
+    }
+}
+
+/// Standard broker over the exact RendererSessions instance used by the tmux
+/// backend. This keeps credentials single-owner while allowing the async socket
+/// runtime to redeem them without holding a lock across IO.
+pub struct SessionRendererBroker<A> {
+    sessions: Arc<StdMutex<RendererSessions>>,
+    actions: A,
+}
+
+impl<A> SessionRendererBroker<A> {
+    #[must_use]
+    pub fn new(sessions: Arc<StdMutex<RendererSessions>>, actions: A) -> Self {
+        Self { sessions, actions }
+    }
+}
+
+impl<A: RendererActionExecutor> RendererBroker for SessionRendererBroker<A> {
+    fn redeem(&self, window_display_id: &str, token: &str) -> Result<RendererStream, String> {
+        let id = WindowDisplayId::new(window_display_id).map_err(|error| error.to_string())?;
+        self.sessions
+            .lock()
+            .map_err(|_| "renderer session lock is poisoned".to_owned())?
+            .redeem(&id, token, Instant::now())
+            .map_err(|error| error.to_string())
+    }
+
+    fn action(
+        &self,
+        window_display_id: String,
+        generation: u64,
+        action: RendererAction,
+    ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + '_>> {
+        let id = match WindowDisplayId::new(&window_display_id) {
+            Ok(id) => id,
+            Err(error) => return Box::pin(async move { Err(error.to_string()) }),
+        };
+        let current = self
+            .sessions
+            .lock()
+            .map(|sessions| sessions.is_current_generation(&id, generation))
+            .unwrap_or(false);
+        if !current {
+            return Box::pin(async { Err("stale renderer generation".to_owned()) });
+        }
+        self.actions.execute(window_display_id, action)
+    }
 }
 
 /// Pure reconnect policy seam. Disconnection never proves server loss.
@@ -276,6 +360,52 @@ where
     C: FnOnce(RuntimeShutdown) -> CF,
     CF: Future<Output = ()>,
 {
+    serve_inner(owned, limits, handler, None, shutdown, cleanup).await
+}
+
+/// Variant used by the daemon display service. Renderer redemption takes over
+/// the accepted connection and bypasses ordinary request caching/multiplexing.
+pub async fn serve_with_renderers<H, HF, S, C, CF>(
+    owned: OwnedSocket,
+    limits: RuntimeLimits,
+    handler: H,
+    renderer_broker: Arc<dyn RendererBroker>,
+    shutdown: S,
+    cleanup: C,
+) -> Result<RuntimeShutdown, RuntimeError>
+where
+    H: Fn(RequestEnvelope) -> HF + Clone + Send + Sync + 'static,
+    HF: Future<Output = Result<Value, String>> + Send + 'static,
+    S: Future<Output = RuntimeShutdown> + Send,
+    C: FnOnce(RuntimeShutdown) -> CF,
+    CF: Future<Output = ()>,
+{
+    serve_inner(
+        owned,
+        limits,
+        handler,
+        Some(renderer_broker),
+        shutdown,
+        cleanup,
+    )
+    .await
+}
+
+async fn serve_inner<H, HF, S, C, CF>(
+    owned: OwnedSocket,
+    limits: RuntimeLimits,
+    handler: H,
+    renderer_broker: Option<Arc<dyn RendererBroker>>,
+    shutdown: S,
+    cleanup: C,
+) -> Result<RuntimeShutdown, RuntimeError>
+where
+    H: Fn(RequestEnvelope) -> HF + Clone + Send + Sync + 'static,
+    HF: Future<Output = Result<Value, String>> + Send + 'static,
+    S: Future<Output = RuntimeShutdown> + Send,
+    C: FnOnce(RuntimeShutdown) -> CF,
+    CF: Future<Output = ()>,
+{
     let limits = limits.validate()?;
     let connections = Arc::new(Semaphore::new(limits.max_connections));
     let inflight = Arc::new(Semaphore::new(limits.max_inflight));
@@ -289,7 +419,15 @@ where
             accepted = owned.listener.accept() => {
                 let (stream, _) = accepted.map_err(|source| RuntimeError::Io { path: owned.path.clone(), source })?;
                 let Ok(permit) = connections.clone().try_acquire_owned() else { continue };
-                tasks.spawn(connection_loop(stream, limits, handler.clone(), inflight.clone(), cache.clone(), permit));
+                tasks.spawn(connection_loop(
+                    stream,
+                    limits,
+                    handler.clone(),
+                    renderer_broker.clone(),
+                    inflight.clone(),
+                    cache.clone(),
+                    permit,
+                ));
             }
         }
     };
@@ -310,6 +448,7 @@ async fn connection_loop<H, HF>(
     stream: UnixStream,
     limits: RuntimeLimits,
     handler: H,
+    renderer_broker: Option<Arc<dyn RendererBroker>>,
     inflight: Arc<Semaphore>,
     cache: Arc<Mutex<RequestResultCache<Vec<u8>>>>,
     _connection: tokio::sync::OwnedSemaphorePermit,
@@ -322,6 +461,7 @@ async fn connection_loop<H, HF>(
     let per_connection = Arc::new(Semaphore::new(limits.max_inflight_per_connection));
     let mut decoder = FrameDecoder::default();
     let mut buffer = [0_u8; 8192];
+    let mut first_frame = true;
     loop {
         let Ok(result) = timeout(limits.connection_idle, reader.read(&mut buffer)).await else {
             break;
@@ -334,6 +474,38 @@ async fn connection_loop<H, HF>(
             break;
         };
         for frame in frames {
+            let renderer_redemption = renderer_broker.as_ref().and_then(|broker| {
+                RequestEnvelope::decode(&frame)
+                    .ok()
+                    .filter(|envelope| envelope.kind == RequestKind::RendererRedeem)
+                    .map(|envelope| (Arc::clone(broker), envelope))
+            });
+            if let Some((broker, envelope)) = renderer_redemption {
+                if !first_frame {
+                    return;
+                }
+                let Ok(redemption) = envelope.renderer_redemption() else {
+                    return;
+                };
+                let Ok(stream) = broker.redeem(redemption.window_display_id(), redemption.token())
+                else {
+                    // Authentication failures deliberately reveal no content
+                    // and no credential classification to the child.
+                    return;
+                };
+                let generation = stream.generation();
+                renderer_connection_loop(
+                    &mut reader,
+                    &writer,
+                    broker,
+                    redemption.window_display_id().to_owned(),
+                    generation,
+                    stream.into_receiver(),
+                )
+                .await;
+                return;
+            }
+            first_frame = false;
             let Ok(local) = per_connection.clone().try_acquire_owned() else {
                 return;
             };
@@ -354,6 +526,62 @@ async fn connection_loop<H, HF>(
             });
         }
     }
+}
+
+async fn renderer_connection_loop(
+    reader: &mut tokio::net::unix::OwnedReadHalf,
+    writer: &Arc<Mutex<tokio::net::unix::OwnedWriteHalf>>,
+    broker: Arc<dyn RendererBroker>,
+    display_id: String,
+    generation: u64,
+    messages: Receiver<RendererMessage>,
+) {
+    const STREAM_TICK: Duration = Duration::from_millis(20);
+    const MAX_MESSAGES_PER_TICK: usize = 16;
+    let mut decoder = FrameDecoder::default();
+    let mut buffer = [0_u8; 4096];
+    let mut ticker = tokio::time::interval(STREAM_TICK);
+    loop {
+        tokio::select! {
+            _ = ticker.tick() => {
+                for _ in 0..MAX_MESSAGES_PER_TICK {
+                    match messages.try_recv() {
+                        Ok(message) => {
+                            let terminate = matches!(message, RendererMessage::Terminate { .. });
+                            let Ok(encoded) = message.encode_line() else { return };
+                            if writer.lock().await.write_all(&encoded).await.is_err() { return; }
+                            if terminate { return; }
+                        }
+                        Err(std::sync::mpsc::TryRecvError::Empty) => break,
+                        Err(std::sync::mpsc::TryRecvError::Disconnected) => return,
+                    }
+                }
+            }
+            read = reader.read(&mut buffer) => {
+                let Ok(read) = read else { return };
+                if read == 0 { return; }
+                let Ok(frames) = decoder.push(&buffer[..read]) else { return; };
+                if frames.len() > MAX_MESSAGES_PER_TICK { return; }
+                for frame in frames {
+                    let Ok(action) = RendererAction::decode(&frame) else { return; };
+                    if let Err(message) = broker.action(display_id.clone(), generation, action).await {
+                        let message = bounded_error(&message);
+                        let frame = RendererMessage::Error { message };
+                        let Ok(encoded) = frame.encode_line() else { return; };
+                        if writer.lock().await.write_all(&encoded).await.is_err() { return; }
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn bounded_error(message: &str) -> String {
+    message
+        .chars()
+        .filter(|character| !character.is_control())
+        .take(512)
+        .collect()
 }
 
 async fn process_frame<H, HF>(
@@ -540,8 +768,14 @@ fn effective_user_id() -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::notification::{Notification, NotificationDraft, Presentation};
+    use crate::protocol::{RendererContent, RendererRedemption, RendererTermination};
+    use crate::render::{SessionLimits, WindowDisplayId};
+    use chrono::Utc;
     use std::os::unix::net::UnixListener as StdListener;
+    use std::sync::Mutex as StdMutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
     use tokio::sync::oneshot;
     use uuid::Uuid;
 
@@ -637,6 +871,122 @@ mod tests {
         stop_tx.send(RuntimeShutdown::Signal).unwrap();
         assert_eq!(server.await.unwrap().unwrap(), RuntimeShutdown::Signal);
         assert!(!path.exists());
+    }
+
+    #[derive(Default)]
+    struct FakeActions(StdMutex<Vec<(String, RendererAction)>>);
+
+    impl RendererActionExecutor for Arc<FakeActions> {
+        fn execute(
+            &self,
+            window_display_id: String,
+            action: RendererAction,
+        ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + '_>> {
+            self.0.lock().unwrap().push((window_display_id, action));
+            Box::pin(async { Ok(()) })
+        }
+    }
+
+    fn renderer_content() -> RendererContent {
+        let draft =
+            NotificationDraft::new(Presentation::Toast, "private", "content", None).unwrap();
+        RendererContent::from(&Notification::from_draft(draft, Utc::now()))
+    }
+
+    #[tokio::test]
+    async fn renderer_connection_redeems_streams_and_binds_actions_to_display() {
+        let temp = private_dir();
+        let path = temp.path().join("daemon.sock");
+        let owner = OwnedSocket::bind(&path).unwrap();
+        let sessions = Arc::new(StdMutex::new(
+            RendererSessions::new(SessionLimits::default()).unwrap(),
+        ));
+        let display_id = WindowDisplayId::new("display-1").unwrap();
+        let launch = sessions
+            .lock()
+            .unwrap()
+            .create(display_id.clone(), renderer_content(), Instant::now())
+            .unwrap();
+        let token = launch.token().expose_secret().to_owned();
+        let actions = Arc::new(FakeActions::default());
+        let broker: Arc<dyn RendererBroker> = Arc::new(SessionRendererBroker::new(
+            Arc::clone(&sessions),
+            Arc::clone(&actions),
+        ));
+        let (stop_tx, stop_rx) = oneshot::channel();
+        let server = tokio::spawn(serve_with_renderers(
+            owner,
+            RuntimeLimits::default(),
+            |_| async { Ok(json!({"ordinary": true})) },
+            broker,
+            async { stop_rx.await.unwrap() },
+            |_| async {},
+        ));
+
+        let mut stream = UnixStream::connect(&path).await.unwrap();
+        stream
+            .write_all(
+                &RendererRedemption::new("display-1", token)
+                    .unwrap()
+                    .encode_line()
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let mut decoder = FrameDecoder::default();
+        let mut bytes = [0_u8; 4096];
+        let initial = loop {
+            let read = timeout(Duration::from_secs(1), stream.read(&mut bytes))
+                .await
+                .unwrap()
+                .unwrap();
+            let frames = decoder.push(&bytes[..read]).unwrap();
+            if let Some(frame) = frames.first() {
+                break RendererMessage::decode(frame).unwrap();
+            }
+        };
+        assert!(matches!(
+            initial,
+            RendererMessage::Initial { content } if content.title() == "private"
+        ));
+
+        stream
+            .write_all(&RendererAction::Dismiss.encode_line().unwrap())
+            .await
+            .unwrap();
+        timeout(Duration::from_secs(1), async {
+            loop {
+                if !actions.0.lock().unwrap().is_empty() {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            actions.0.lock().unwrap().as_slice(),
+            &[("display-1".to_owned(), RendererAction::Dismiss)]
+        );
+
+        sessions
+            .lock()
+            .unwrap()
+            .terminate(&display_id, RendererTermination::Dismissed)
+            .unwrap();
+        let read = timeout(Duration::from_secs(1), stream.read(&mut bytes))
+            .await
+            .unwrap()
+            .unwrap();
+        let frames = decoder.push(&bytes[..read]).unwrap();
+        assert!(frames.iter().any(|frame| matches!(
+            RendererMessage::decode(frame).unwrap(),
+            RendererMessage::Terminate {
+                reason: RendererTermination::Dismissed
+            }
+        )));
+        stop_tx.send(RuntimeShutdown::Signal).unwrap();
+        server.await.unwrap().unwrap();
     }
 
     #[test]

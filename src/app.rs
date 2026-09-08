@@ -15,11 +15,12 @@ use tokio::sync::Mutex;
 use crate::cli::{
     ClearArgs, Cli, Command, DoctorArgs, HistoryAction, HistoryArgs, HookAction, HookArgs,
     HookEventArgs, HookMutationArgs, HookScopeArg, HookSelectionArgs, ProviderArg, Selector,
-    TmuxTarget,
+    TmuxTarget, RendererArgs,
 };
 use crate::config::{Config, ConfigOverrides, FeatureMode, HooksConfig, TimeoutValue, load};
 use crate::daemon::runtime::{
-    OwnedSocket, RuntimeError, RuntimeLimits, RuntimeShutdown, ServerIdentity, serve, submit_lazy,
+    OwnedSocket, RuntimeError, RuntimeLimits, RuntimeShutdown, ServerIdentity,
+    SessionRendererBroker, serve_with_renderers, submit_lazy,
 };
 use crate::daemon::{
     DaemonService, JumpExecutor, LiveScheduler, MonotonicTime, SchedulerLimits, ShutdownReason,
@@ -37,7 +38,17 @@ use crate::protocol::{
 use crate::providers::HookPolicy;
 use crate::tmux::{
     Backend as _, DisplayPlan as TmuxDisplayPlan, JumpTarget, PaneId, ProductionBackend, Server,
+    WindowId,
 };
+use crate::renderer_runtime::{RendererKind, RendererRuntimeError, run_hidden_renderer};
+
+/// App-facing dispatch target for both hidden renderer subcommands. Keeping it
+/// here lets the one-binary entry point route modes without learning socket or
+/// terminal mechanics.
+pub fn run_renderer_command(kind: RendererKind, arguments: RendererArgs) -> Result<(), AppError> {
+    run_hidden_renderer(kind, &arguments.window_display, &arguments.token)?;
+    Ok(())
+}
 
 /// Hook mutations are silent on success. Status is a command result and is
 /// written to stdout by the caller-provided writer.
@@ -166,6 +177,8 @@ pub enum AppError {
     DoctorOutput(#[from] DoctorOutputError),
     #[error("failed to write command output: {0}")]
     Output(#[from] io::Error),
+    #[error(transparent)]
+    Renderer(#[from] RendererRuntimeError),
 }
 
 /// Runs the complete public/hidden command dispatcher. Successful direct
@@ -273,9 +286,14 @@ pub async fn run(cli: Cli) -> Result<(), RuntimeAppError> {
             )
             .await
         }
-        Command::RenderToast(_) | Command::RenderAttention(_) => Err(RuntimeAppError::Execution(
-            "renderer broker is not available".into(),
-        )),
+        Command::RenderToast(arguments) => {
+            run_renderer_command(RendererKind::Toast, arguments)?;
+            Ok(())
+        }
+        Command::RenderAttention(arguments) => {
+            run_renderer_command(RendererKind::Attention, arguments)?;
+            Ok(())
+        }
         Command::HookEvent(_) => unreachable!("hook mode returned before regular dispatch"),
     }
 }
@@ -570,6 +588,26 @@ impl JumpExecutor for ProductionJump {
                 .map_err(|error| error.to_string())
         })
     }
+
+    fn jump_from_attention(
+        &self,
+        source: SourceContext,
+        attention_window: String,
+    ) -> Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send + '_>> {
+        Box::pin(async move {
+            let mut backend = self.backend.lock().await;
+            let topology = backend.topology().map_err(|error| error.to_string())?;
+            let likely_client = topology
+                .likely_client_for_window(&WindowId(attention_window))
+                .map(str::to_owned);
+            backend
+                .jump(&JumpTarget {
+                    pane_id: PaneId(source.pane_id().to_owned()),
+                    likely_client,
+                })
+                .map_err(|error| error.to_string())
+        })
+    }
 }
 
 async fn run_daemon(
@@ -596,6 +634,7 @@ async fn run_daemon(
         )?,
         MonotonicTime::default(),
     );
+    let renderer_sessions = production.renderer_sessions();
     let backend = Arc::new(Mutex::new(production));
     let service = DaemonService::new(
         scheduler,
@@ -605,6 +644,24 @@ async fn run_daemon(
         },
     );
     let scheduler = service.scheduler();
+    let action_service = service.clone();
+    let renderer_broker = Arc::new(SessionRendererBroker::new(
+        renderer_sessions,
+        move |display_id, action| {
+            let service = action_service.clone();
+            async move {
+                service
+                    .handle_renderer_action(
+                        &display_id,
+                        action,
+                        monotonic(origin),
+                        Utc::now(),
+                    )
+                    .await
+                    .map_err(|error| error.to_string())
+            }
+        },
+    ));
     let stopping = Arc::new(AtomicBool::new(false));
     let reconcile_task = tokio::spawn(reconcile_loop(
         Arc::clone(&backend),
@@ -635,10 +692,11 @@ async fn run_daemon(
     let cleanup_backend = Arc::clone(&backend);
     let cleanup_history = Arc::clone(&history);
     let cleanup_stopping = Arc::clone(&stopping);
-    let result = serve(
+    let result = serve_with_renderers(
         owned,
         RuntimeLimits::default(),
         handler,
+        renderer_broker,
         shutdown_signal(shutdown_path),
         move |reason| async move {
             cleanup_stopping.store(true, Ordering::Release);
