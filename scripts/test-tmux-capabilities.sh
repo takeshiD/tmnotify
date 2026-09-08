@@ -65,7 +65,9 @@ run_tmux new-window -d -t tmnotify-ci -n source
 source_pane=$(run_tmux display-message -p -t tmnotify-ci:source '#{pane_id}')
 run_tmux break-pane -W -d -s "$source_pane" -t "$target_window" -X 1 -Y 1 -x 32 -y 9
 
-pane_snapshot=$(run_tmux list-panes -t "$target_window" -F '#{pane_id} #{pane_floating_flag}')
+# A -W floating pane retains its owning window ID while being projected into
+# the destination window, so inspect the whole isolated server.
+pane_snapshot=$(run_tmux list-panes -a -F '#{pane_id} #{pane_floating_flag}')
 floating_pane=$(printf '%s\n' "$pane_snapshot" | awk '$2 == 1 { print $1; exit }')
 [ -n "$floating_pane" ] || {
     echo "break-pane did not create a floating pane" >&2
