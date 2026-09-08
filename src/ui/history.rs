@@ -572,9 +572,23 @@ pub fn run(
     launch: HistoryLaunch,
     backend: impl HistoryActionBackend,
 ) -> Result<HistoryOutcome, HistoryUiError> {
+    run_with_options(launch, false, backend)
+}
+
+pub fn run_with_options(
+    launch: HistoryLaunch,
+    include_hidden: bool,
+    backend: impl HistoryActionBackend,
+) -> Result<HistoryOutcome, HistoryUiError> {
     let mut terminal = TerminalSession::enter()?;
     let mut events = CrosstermEvents::new()?;
-    run_with_terminal(terminal.terminal_mut(), &mut events, launch, backend)
+    run_with_terminal_options(
+        terminal.terminal_mut(),
+        &mut events,
+        launch,
+        include_hidden,
+        backend,
+    )
 }
 
 pub fn run_with_terminal<B: Backend, E: HistoryEventSource>(
@@ -586,11 +600,25 @@ pub fn run_with_terminal<B: Backend, E: HistoryEventSource>(
 where
     B::Error: std::fmt::Display,
 {
+    run_with_terminal_options(terminal, events, launch, false, backend)
+}
+
+fn run_with_terminal_options<B: Backend, E: HistoryEventSource>(
+    terminal: &mut Terminal<B>,
+    events: &mut E,
+    launch: HistoryLaunch,
+    include_hidden: bool,
+    backend: impl HistoryActionBackend,
+) -> Result<HistoryOutcome, HistoryUiError>
+where
+    B::Error: std::fmt::Display,
+{
     let current_server = launch.current_server();
     let mut view = HistoryView::loading_for_scope(current_server);
     let bridge = ActionBridge::spawn(backend)?;
     bridge
         .submit(WorkerCommand::Load(HistoryQuery {
+            include_hidden,
             all_servers: launch.all_servers(),
             ..HistoryQuery::default()
         }))

@@ -694,6 +694,59 @@ pub struct RendererContent {
     #[serde(skip_serializing_if = "Option::is_none")]
     source: Option<RendererSource>,
     metadata: RendererMetadata,
+    #[serde(default)]
+    display: RendererDisplayOptions,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum RendererBodyMode {
+    FirstLine,
+    JoinLines,
+    Wrap,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RendererDisplayOptions {
+    body: RendererBodyMode,
+    unicode: bool,
+    color: bool,
+}
+
+impl Default for RendererDisplayOptions {
+    fn default() -> Self {
+        Self {
+            body: RendererBodyMode::FirstLine,
+            unicode: true,
+            color: true,
+        }
+    }
+}
+
+impl RendererDisplayOptions {
+    #[must_use]
+    pub fn new(body: RendererBodyMode, unicode: bool, color: bool) -> Self {
+        Self {
+            body,
+            unicode,
+            color,
+        }
+    }
+
+    #[must_use]
+    pub fn body(self) -> RendererBodyMode {
+        self.body
+    }
+
+    #[must_use]
+    pub fn unicode(self) -> bool {
+        self.unicode
+    }
+
+    #[must_use]
+    pub fn color(self) -> bool {
+        self.color
+    }
 }
 
 impl RendererContent {
@@ -743,6 +796,17 @@ impl RendererContent {
     pub fn metadata(&self) -> &RendererMetadata {
         &self.metadata
     }
+
+    #[must_use]
+    pub fn display_options(&self) -> RendererDisplayOptions {
+        self.display
+    }
+
+    #[must_use]
+    pub fn with_display_options(mut self, display: RendererDisplayOptions) -> Self {
+        self.display = display;
+        self
+    }
 }
 
 impl From<&Notification> for RendererContent {
@@ -772,6 +836,7 @@ impl From<&Notification> for RendererContent {
                 agent_name: metadata.agent_name().map(str::to_owned),
                 tool_name: metadata.tool_name().map(str::to_owned),
             },
+            display: RendererDisplayOptions::default(),
         }
     }
 }
@@ -1263,6 +1328,7 @@ mod tests {
                     agent_name: None,
                     tool_name: None,
                 },
+                display: RendererDisplayOptions::default(),
             },
         };
         let encoded = message.encode_line().unwrap();

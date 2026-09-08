@@ -192,14 +192,31 @@ impl History {
         config: &HistoryConfig,
         now: DateTime<Utc>,
     ) -> Result<Self, HistoryError> {
-        Self::open_with_capacity(path, current_server, config, now, DEFAULT_QUEUE_CAPACITY)
+        Self::open_with_capacity(
+            path,
+            current_server,
+            config,
+            Some(now),
+            DEFAULT_QUEUE_CAPACITY,
+        )
+    }
+
+    /// Opens History for CLI/UI reads and mutations without performing daemon
+    /// crash recovery. Only a newly elected daemon may decide that this
+    /// server's persisted live rows are stale.
+    pub fn open_reader(
+        path: impl AsRef<Path>,
+        current_server: TmuxServerId,
+        config: &HistoryConfig,
+    ) -> Result<Self, HistoryError> {
+        Self::open_with_capacity(path, current_server, config, None, DEFAULT_QUEUE_CAPACITY)
     }
 
     fn open_with_capacity(
         path: impl AsRef<Path>,
         current_server: TmuxServerId,
         config: &HistoryConfig,
-        now: DateTime<Utc>,
+        recovery_time: Option<DateTime<Utc>>,
         queue_capacity: usize,
     ) -> Result<Self, HistoryError> {
         if !config.enabled {
@@ -217,7 +234,9 @@ impl History {
         ensure_private_directory(parent)?;
         let mut connection = open_connection(path)?;
         migrate(&mut connection)?;
-        recover_stale(&connection, &current_server, now)?;
+        if let Some(now) = recovery_time {
+            recover_stale(&connection, &current_server, now)?;
+        }
         enforce_retention(&connection, config.max_entries)?;
 
         let (sender, receiver) = mpsc::sync_channel(queue_capacity.max(1));
@@ -1400,6 +1419,56 @@ mod tests {
         assert_eq!(recovered.delivery, DeliveryState::Closed);
         assert_eq!(recovered.close_reason, Some(CloseReason::DaemonInterrupted));
         assert_eq!(untouched.delivery, DeliveryState::Pending);
+    }
+
+    #[tokio::test]
+    async fn reader_open_does_not_recover_a_live_daemons_rows() {
+        let temporary = TempDir::new().unwrap();
+        let path = history_path(&temporary);
+        let now = DateTime::from_timestamp_millis(1_000).unwrap();
+        {
+            let daemon = History::open(&path, server("alpha"), &config(100), now).unwrap();
+            daemon
+                .persist(&notification("alpha", "live", now))
+                .unwrap()
+                .wait()
+                .await
+                .unwrap();
+            daemon.flush().unwrap().wait().await.unwrap();
+
+            let reader = History::open_reader(&path, server("alpha"), &config(100)).unwrap();
+            let entries = reader
+                .list(HistoryQuery::default())
+                .unwrap()
+                .wait()
+                .await
+                .unwrap();
+            assert_eq!(entries.len(), 1);
+            assert_eq!(entries[0].delivery, DeliveryState::Pending);
+            assert_eq!(entries[0].close_reason, None);
+        }
+    }
+
+    #[tokio::test]
+    async fn worker_commits_when_a_nonblocking_caller_drops_the_receipt() {
+        let temporary = TempDir::new().unwrap();
+        let path = history_path(&temporary);
+        let now = DateTime::from_timestamp_millis(1_000).unwrap();
+        let history = History::open(&path, server("alpha"), &config(100), now).unwrap();
+        drop(
+            history
+                .persist(&notification("alpha", "queued", now))
+                .unwrap(),
+        );
+        history.flush().unwrap().wait().await.unwrap();
+        let entries = history
+            .list(HistoryQuery::default())
+            .unwrap()
+            .wait()
+            .await
+            .unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].body, "queued");
     }
 
     #[tokio::test]

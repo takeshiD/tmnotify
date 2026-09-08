@@ -228,6 +228,8 @@ pub struct RendererArgs {
 pub struct HistoryUiArgs {
     #[arg(long)]
     pub all_servers: bool,
+    #[arg(long)]
+    pub include_hidden: bool,
 }
 
 #[derive(Debug, Args, PartialEq)]

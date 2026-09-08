@@ -5,8 +5,9 @@ use std::time::Duration;
 use chrono::{DateTime, Utc};
 
 use super::{DisplayPlan as SchedulerDisplayPlan, LiveScheduler, MonotonicTime, SchedulerError};
+use crate::config::{BodyPresentation, Placement, StackOrder};
 use crate::notification::NotificationId;
-use crate::protocol::RendererContent;
+use crate::protocol::{RendererBodyMode, RendererContent, RendererDisplayOptions};
 use crate::tmux::{
     Backend, DisplayKind, DisplayPlan, Event, Geometry, PlannedDisplay, ReconcileReport, Topology,
     WindowId, WindowSize,
@@ -20,19 +21,29 @@ const MAX_RECONNECT_BACKOFF: Duration = Duration::from_secs(5);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct WindowDisplayPolicy {
+    pub placement: Placement,
     pub toast_width: u16,
     pub toast_height: u16,
     pub toast_gap: u16,
     pub max_visible_toasts: usize,
+    pub stack_order: StackOrder,
+    pub body: BodyPresentation,
+    pub unicode: bool,
+    pub color: bool,
 }
 
 impl Default for WindowDisplayPolicy {
     fn default() -> Self {
         Self {
+            placement: Placement::TopRight,
             toast_width: 42,
             toast_height: 3,
             toast_gap: 1,
             max_visible_toasts: 4,
+            stack_order: StackOrder::OldestFirst,
+            body: BodyPresentation::FirstLine,
+            unicode: true,
+            color: true,
         }
     }
 }
@@ -307,7 +318,7 @@ impl WindowReconciler {
                     id,
                     size,
                     initial_ids.contains(&id),
-                    renderer_content(scheduler, id),
+                    renderer_content(scheduler, id, self.policy),
                 )]
             } else {
                 self.planned_toasts(
@@ -373,23 +384,30 @@ impl WindowReconciler {
         let stride = height.saturating_add(self.policy.toast_gap).max(1);
         let capacity = usize::from(size.height.saturating_add(self.policy.toast_gap) / stride)
             .min(self.policy.max_visible_toasts);
-        ids.iter()
-            .take(capacity)
+        let ids = match self.policy.stack_order {
+            StackOrder::OldestFirst => ids.iter().take(capacity).copied().collect::<Vec<_>>(),
+            StackOrder::NewestFirst => ids.iter().rev().take(capacity).copied().collect(),
+        };
+        let mut placement_slots = [0_usize; 6];
+        ids.into_iter()
             .enumerate()
-            .map(|(index, id)| PlannedDisplay {
-                display_id: display_id(*id, window),
-                kind: DisplayKind::Toast,
-                geometry: Geometry {
-                    x: size.width.saturating_sub(width),
-                    y: u16::try_from(index)
-                        .unwrap_or(u16::MAX)
-                        .saturating_mul(stride),
-                    width,
-                    height,
-                    z_index: u16::try_from(index).unwrap_or(u16::MAX),
-                },
-                content: renderer_content(scheduler, *id),
-                play_enter_animation: initial_ids.contains(id),
+            .map(|(z_index, id)| {
+                let placement = scheduler
+                    .notification(id)
+                    .and_then(|notification| notification.overrides().position())
+                    .map(config_placement)
+                    .unwrap_or(self.policy.placement);
+                let slot = &mut placement_slots[placement_index(placement)];
+                let geometry =
+                    toast_geometry(size, width, height, stride, *slot, placement, z_index);
+                *slot = slot.saturating_add(1);
+                PlannedDisplay {
+                    display_id: display_id(id, window),
+                    kind: DisplayKind::Toast,
+                    geometry,
+                    content: renderer_content(scheduler, id, self.policy),
+                    play_enter_animation: initial_ids.contains(&id),
+                }
             })
             .collect()
     }
@@ -481,12 +499,79 @@ impl WindowReconciler {
     }
 }
 
-fn renderer_content(scheduler: &LiveScheduler, id: NotificationId) -> RendererContent {
+fn config_placement(placement: crate::notification::Placement) -> Placement {
+    match placement {
+        crate::notification::Placement::TopLeft => Placement::TopLeft,
+        crate::notification::Placement::TopCenter => Placement::TopCenter,
+        crate::notification::Placement::TopRight => Placement::TopRight,
+        crate::notification::Placement::BottomLeft => Placement::BottomLeft,
+        crate::notification::Placement::BottomCenter => Placement::BottomCenter,
+        crate::notification::Placement::BottomRight => Placement::BottomRight,
+    }
+}
+
+fn placement_index(placement: Placement) -> usize {
+    match placement {
+        Placement::TopLeft => 0,
+        Placement::TopCenter => 1,
+        Placement::TopRight => 2,
+        Placement::BottomLeft => 3,
+        Placement::BottomCenter => 4,
+        Placement::BottomRight => 5,
+    }
+}
+
+fn toast_geometry(
+    size: WindowSize,
+    width: u16,
+    height: u16,
+    stride: u16,
+    index: usize,
+    placement: Placement,
+    z_index: usize,
+) -> Geometry {
+    let offset = u16::try_from(index)
+        .unwrap_or(u16::MAX)
+        .saturating_mul(stride);
+    let x = match placement {
+        Placement::TopLeft | Placement::BottomLeft => 0,
+        Placement::TopCenter | Placement::BottomCenter => size.width.saturating_sub(width) / 2,
+        Placement::TopRight | Placement::BottomRight => size.width.saturating_sub(width),
+    };
+    let y = match placement {
+        Placement::TopLeft | Placement::TopCenter | Placement::TopRight => offset,
+        Placement::BottomLeft | Placement::BottomCenter | Placement::BottomRight => {
+            size.height.saturating_sub(height).saturating_sub(offset)
+        }
+    };
+    Geometry {
+        x,
+        y,
+        width,
+        height,
+        z_index: u16::try_from(z_index).unwrap_or(u16::MAX),
+    }
+}
+
+fn renderer_content(
+    scheduler: &LiveScheduler,
+    id: NotificationId,
+    policy: WindowDisplayPolicy,
+) -> RendererContent {
     RendererContent::from(
         scheduler
             .notification(id)
             .expect("display plan IDs must refer to live Notifications"),
     )
+    .with_display_options(RendererDisplayOptions::new(
+        match policy.body {
+            BodyPresentation::FirstLine => RendererBodyMode::FirstLine,
+            BodyPresentation::JoinLines => RendererBodyMode::JoinLines,
+            BodyPresentation::Wrap => RendererBodyMode::Wrap,
+        },
+        policy.unicode,
+        policy.color,
+    ))
 }
 
 fn display_id(id: NotificationId, window: &WindowId) -> String {
@@ -517,8 +602,8 @@ mod tests {
     use super::*;
     use crate::daemon::SchedulerLimits;
     use crate::notification::{
-        CloseReason, NotificationDraft, Presentation, Priority, SourceContext, Timeout,
-        TmuxServerId,
+        CloseReason, NotificationDraft, Placement as NotificationPlacement, Presentation,
+        PresentationOverrides, Priority, SourceContext, Timeout, TmuxServerId,
     };
     use crate::tmux::{ClientView, Error as TmuxError, Pane, PaneId};
 
@@ -651,6 +736,45 @@ mod tests {
         assert_eq!(outcome.visible_windows, [WindowId("@1".into())].into());
         assert_eq!(backend.plans[0].windows.len(), 1);
         assert_eq!(backend.plans[0].windows[&WindowId("@1".into())].len(), 1);
+    }
+
+    #[test]
+    fn configured_stack_and_per_notification_placement_reach_display_geometry() {
+        let mut backend = FakeBackend {
+            topology: topology(&[("a", false, "@1")], &[("@1", 80, 24)]),
+            ..FakeBackend::default()
+        };
+        let mut scheduler = scheduler();
+        let first = scheduler.submit(toast("first"), mono(0), wall(0)).unwrap();
+        let second = scheduler
+            .submit(
+                toast("second").with_overrides(
+                    PresentationOverrides::default()
+                        .with_position(NotificationPlacement::BottomLeft),
+                ),
+                mono(1),
+                wall(1),
+            )
+            .unwrap();
+        let mut reconciler = WindowReconciler::new(
+            WindowDisplayPolicy {
+                placement: Placement::BottomCenter,
+                stack_order: StackOrder::NewestFirst,
+                ..WindowDisplayPolicy::default()
+            },
+            mono(0),
+        );
+
+        reconciler
+            .tick(&mut backend, &mut scheduler, mono(1), wall(1))
+            .unwrap();
+        let displays = &backend.plans[0].windows[&WindowId("@1".into())];
+        assert!(displays[0].display_id.starts_with(&second.id.to_string()));
+        assert_eq!(displays[0].geometry.x, 0);
+        assert_eq!(displays[0].geometry.y, 21);
+        assert!(displays[1].display_id.starts_with(&first.id.to_string()));
+        assert_eq!(displays[1].geometry.x, 19);
+        assert_eq!(displays[1].geometry.y, 21);
     }
 
     #[test]

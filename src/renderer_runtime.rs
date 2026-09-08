@@ -13,13 +13,16 @@ use std::time::Duration;
 use crossterm::event::{self, Event};
 use thiserror::Error;
 
+use crate::config::BodyPresentation;
 use crate::daemon::runtime::ServerIdentity;
 use crate::platform::{Environment, PathError, PlatformPaths, validate_runtime_socket};
 use crate::protocol::{
-    FrameDecoder, ProtocolError, RendererAction, RendererContent, RendererMessage,
-    RendererRedemption,
+    FrameDecoder, ProtocolError, RendererAction, RendererBodyMode, RendererContent,
+    RendererMessage, RendererRedemption,
 };
-use crate::toast::{DisplayAge, Rect, RenderOptions, Surface, Toast, render_toast};
+use crate::toast::{
+    ColorMode, DisplayAge, GlyphMode, Rect, RenderOptions, Surface, Toast, render_toast,
+};
 use crate::ui::attention::{AttentionCommand, AttentionState};
 use crate::ui::{InterruptWatcher, TerminalSession};
 
@@ -174,7 +177,7 @@ impl<W: Write> ToastTerminal<W> {
                 height,
             },
             surface,
-            RenderOptions::default(),
+            render_options(content),
         );
         self.output.write_all(HIDE_AND_CLEAR)?;
         for (index, line) in rendered.styled_lines.iter().enumerate() {
@@ -185,6 +188,28 @@ impl<W: Write> ToastTerminal<W> {
         }
         self.output.flush()?;
         Ok(())
+    }
+}
+
+fn render_options(content: &RendererContent) -> RenderOptions {
+    let display = content.display_options();
+    RenderOptions {
+        body: match display.body() {
+            RendererBodyMode::FirstLine => BodyPresentation::FirstLine,
+            RendererBodyMode::JoinLines => BodyPresentation::JoinLines,
+            RendererBodyMode::Wrap => BodyPresentation::Wrap,
+        },
+        glyphs: if display.unicode() {
+            GlyphMode::Unicode
+        } else {
+            GlyphMode::Ascii
+        },
+        color: if display.color() {
+            ColorMode::Ansi16
+        } else {
+            ColorMode::Monochrome
+        },
+        show_jump_hint: true,
     }
 }
 
@@ -224,7 +249,12 @@ fn run_attention(mut connection: RendererConnection) -> Result<(), RendererRunti
         while let Some(message) = connection.poll()? {
             match message {
                 RendererMessage::Initial { content } | RendererMessage::Update { content } => {
-                    state = Some(AttentionState::from_renderer_content(&content, true, true)?);
+                    let display = content.display_options();
+                    state = Some(AttentionState::from_renderer_content(
+                        &content,
+                        display.unicode(),
+                        display.color(),
+                    )?);
                 }
                 RendererMessage::Error { message } => {
                     if let Some(state) = &mut state {
@@ -376,5 +406,23 @@ mod tests {
         assert!(bytes.starts_with(HIDE_AND_CLEAR));
         assert!(bytes.windows("build".len()).any(|part| part == b"build"));
         assert!(bytes.ends_with(RESTORE_TERMINAL));
+    }
+
+    #[test]
+    fn daemon_display_options_control_renderer_body_glyphs_and_color() {
+        let content = content().with_display_options(crate::protocol::RendererDisplayOptions::new(
+            RendererBodyMode::JoinLines,
+            false,
+            false,
+        ));
+        assert_eq!(
+            render_options(&content),
+            RenderOptions {
+                body: BodyPresentation::JoinLines,
+                glyphs: GlyphMode::Ascii,
+                color: ColorMode::Monochrome,
+                show_jump_hint: true,
+            }
+        );
     }
 }

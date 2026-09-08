@@ -11,7 +11,7 @@ mod topology;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use crate::notification::{IngressError, SourceContext, TmuxServerId};
 use crate::protocol::RendererContent;
@@ -241,6 +241,120 @@ impl Server {
         }
         Ok(source)
     }
+
+    /// Starts the interactive History viewer in a focused floating pane.
+    /// tmux receives the executable and fixed arguments as distinct argv
+    /// values; no user or History text crosses a shell-command boundary.
+    pub fn launch_history_ui(
+        &self,
+        window_id: &str,
+        executable: &Path,
+        all_servers: bool,
+        include_hidden: bool,
+    ) -> Result<(), Error> {
+        validate_stable_window_id(window_id)?;
+        let executable = executable
+            .to_str()
+            .filter(|value| !value.contains(['\0', '\n', '\r']))
+            .ok_or_else(|| Error::Protocol("History executable path is not valid UTF-8".into()))?;
+        if !executable.starts_with('/') {
+            return Err(Error::Protocol(
+                "History executable path must be absolute".into(),
+            ));
+        }
+
+        let window = WindowId(window_id.to_owned());
+        let size = self
+            .topology()?
+            .window_size(&window)
+            .ok_or_else(|| Error::Protocol("History target window no longer exists".into()))?;
+        let width = u16::try_from(u32::from(size.width).saturating_mul(4) / 5)
+            .unwrap_or(size.width)
+            .max(1);
+        let height = u16::try_from(u32::from(size.height).saturating_mul(4) / 5)
+            .unwrap_or(size.height)
+            .max(1);
+        let create =
+            history_ui_create_arguments(window_id, executable, all_servers, include_hidden);
+        let output = run_owned_tmux(self.socket_path(), &create)?;
+        let pane_id = output.trim_end_matches(['\r', '\n']);
+        validate_source_pane_id(pane_id)
+            .map_err(|_| Error::Protocol("tmux did not return a stable History pane ID".into()))?;
+
+        let floating = vec![
+            "break-pane".to_owned(),
+            "-W".to_owned(),
+            "-d".to_owned(),
+            "-s".to_owned(),
+            pane_id.to_owned(),
+            "-t".to_owned(),
+            window_id.to_owned(),
+            "-X".to_owned(),
+            size.width
+                .saturating_sub(width)
+                .checked_div(2)
+                .unwrap_or(0)
+                .to_string(),
+            "-Y".to_owned(),
+            size.height
+                .saturating_sub(height)
+                .checked_div(2)
+                .unwrap_or(0)
+                .to_string(),
+            "-x".to_owned(),
+            width.to_string(),
+            "-y".to_owned(),
+            height.to_string(),
+        ];
+        if let Err(error) = run_owned_tmux(self.socket_path(), &floating) {
+            let _ = capability::run_tmux(self.socket_path(), &["kill-pane", "-t", pane_id]);
+            return Err(error);
+        }
+        capability::run_tmux(self.socket_path(), &["select-pane", "-t", pane_id])?;
+        Ok(())
+    }
+}
+
+fn history_ui_create_arguments(
+    window_id: &str,
+    executable: &str,
+    all_servers: bool,
+    include_hidden: bool,
+) -> Vec<String> {
+    let mut arguments = vec![
+        "split-window".to_owned(),
+        "-d".to_owned(),
+        "-P".to_owned(),
+        "-F".to_owned(),
+        "#{pane_id}".to_owned(),
+        "-t".to_owned(),
+        window_id.to_owned(),
+        executable.to_owned(),
+        "__history-ui".to_owned(),
+    ];
+    if all_servers {
+        arguments.push("--all-servers".to_owned());
+    }
+    if include_hidden {
+        arguments.push("--include-hidden".to_owned());
+    }
+    arguments
+}
+
+fn run_owned_tmux(socket_path: &Path, arguments: &[String]) -> Result<String, Error> {
+    let arguments = arguments.iter().map(String::as_str).collect::<Vec<_>>();
+    capability::run_tmux(socket_path, &arguments).map_err(Error::from)
+}
+
+fn validate_stable_window_id(value: &str) -> Result<(), Error> {
+    if value
+        .strip_prefix('@')
+        .is_some_and(|id| !id.is_empty() && id.bytes().all(|byte| byte.is_ascii_digit()))
+    {
+        Ok(())
+    } else {
+        Err(Error::Protocol("invalid stable tmux window ID".into()))
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -383,5 +497,25 @@ pub(crate) mod fake {
 
         assert_eq!(tmux.plans, vec![plan]);
         assert_eq!(tmux.jumps, vec![jump]);
+    }
+
+    #[test]
+    fn history_ui_launch_keeps_executable_and_flags_as_distinct_arguments() {
+        assert_eq!(
+            history_ui_create_arguments("@4", "/tmp/bin with space/tmnotify", true, true),
+            vec![
+                "split-window",
+                "-d",
+                "-P",
+                "-F",
+                "#{pane_id}",
+                "-t",
+                "@4",
+                "/tmp/bin with space/tmnotify",
+                "__history-ui",
+                "--all-servers",
+                "--include-hidden",
+            ]
+        );
     }
 }

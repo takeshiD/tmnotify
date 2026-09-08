@@ -41,6 +41,10 @@ use crate::tmux::{
     Backend as _, DisplayPlan as TmuxDisplayPlan, JumpTarget, PaneId, ProductionBackend, Server,
     WindowId,
 };
+use crate::ui::history::{
+    HistoryActions, HistoryLaunch, HistoryOutcome, OutsideTmuxScope,
+    run_with_options as run_history_terminal,
+};
 
 /// App-facing dispatch target for both hidden renderer subcommands. Keeping it
 /// here lets the one-binary entry point route modes without learning socket or
@@ -192,6 +196,7 @@ pub async fn run(cli: Cli) -> Result<(), RuntimeAppError> {
     let environment = Environment::current();
     let paths = PlatformPaths::resolve(&environment)?;
     let tmux_environment = environment.get("TMUX").and_then(|value| value.to_str());
+    let inside_tmux = tmux_environment.is_some();
     let target = cli.tmux_target(tmux_environment)?;
     let server = target.map(resolve_server).transpose()?;
     let selected = server
@@ -260,7 +265,18 @@ pub async fn run(cli: Cli) -> Result<(), RuntimeAppError> {
             .await
         }
         Command::History(arguments) => {
-            run_history(arguments, selected.as_ref(), &paths, &config).await
+            match history_mode(&arguments, io::stdout().is_terminal(), inside_tmux) {
+                HistoryMode::Floating => {
+                    launch_history_pane(arguments, require_server(selected)?, &environment)?;
+                    Ok(())
+                }
+                HistoryMode::Terminal => {
+                    run_interactive_history(arguments, selected, &paths, &config)
+                }
+                HistoryMode::Output => {
+                    run_history(arguments, selected.as_ref(), &paths, &config).await
+                }
+            }
         }
         Command::Hook(arguments) => {
             let manager = production_hook_manager(&environment)?;
@@ -271,21 +287,18 @@ pub async fn run(cli: Cli) -> Result<(), RuntimeAppError> {
             run_production_doctor(arguments, selected.as_ref(), &paths, &environment, &config)
         }
         Command::Daemon => run_daemon(require_server(selected)?, paths, config).await,
-        Command::HistoryUi(arguments) => {
-            run_history(
-                HistoryArgs {
-                    action: None,
-                    plain: true,
-                    json: false,
-                    all: false,
-                    all_servers: arguments.all_servers,
-                },
-                selected.as_ref(),
-                &paths,
-                &config,
-            )
-            .await
-        }
+        Command::HistoryUi(arguments) => run_interactive_history(
+            HistoryArgs {
+                action: None,
+                plain: false,
+                json: false,
+                all: arguments.include_hidden,
+                all_servers: arguments.all_servers,
+            },
+            selected,
+            &paths,
+            &config,
+        ),
         Command::RenderToast(arguments) => {
             run_renderer_command(RendererKind::Toast, arguments)?;
             Ok(())
@@ -368,6 +381,99 @@ fn config_timeout(value: TimeoutValue) -> Timeout {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum HistoryMode {
+    Output,
+    Floating,
+    Terminal,
+}
+
+fn history_mode(arguments: &HistoryArgs, stdout_terminal: bool, inside_tmux: bool) -> HistoryMode {
+    if arguments.action.is_some() || arguments.plain || arguments.json || !stdout_terminal {
+        HistoryMode::Output
+    } else if inside_tmux {
+        HistoryMode::Floating
+    } else {
+        HistoryMode::Terminal
+    }
+}
+
+fn launch_history_pane(
+    arguments: HistoryArgs,
+    selected: SelectedServer,
+    environment: &Environment,
+) -> Result<(), RuntimeAppError> {
+    let source =
+        capture_source(&selected, environment)?.ok_or(RuntimeAppError::HistorySourceUnavailable)?;
+    let executable = std::env::current_exe()?;
+    selected.server.launch_history_ui(
+        source.window_id(),
+        &executable,
+        arguments.all_servers,
+        arguments.all,
+    )?;
+    Ok(())
+}
+
+fn run_interactive_history(
+    arguments: HistoryArgs,
+    selected: Option<SelectedServer>,
+    paths: &PlatformPaths,
+    config: &Config,
+) -> Result<(), RuntimeAppError> {
+    let current_server = selected.as_ref().map(|server| server.domain_id.clone());
+    let history_server = current_server
+        .clone()
+        .unwrap_or_else(|| TmuxServerId::new("all-servers").expect("fixed ID is valid"));
+    let history = Arc::new(History::open_reader(
+        &paths.history_file,
+        history_server,
+        &config.history,
+    )?);
+    let launch = match current_server {
+        Some(current_server) if std::env::var_os("TMUX").is_some() => {
+            HistoryLaunch::InsideTmux { current_server }
+        }
+        Some(current_server) => {
+            HistoryLaunch::OutsideTmux(OutsideTmuxScope::ExplicitServer(current_server))
+        }
+        None => HistoryLaunch::OutsideTmux(OutsideTmuxScope::AllServers),
+    };
+
+    let guard_server = selected.clone();
+    let jump_server = selected;
+    let executable = std::env::current_exe()?;
+    let actions = HistoryActions::new(
+        history,
+        || Ok(()),
+        move |source: &SourceContext| match &guard_server {
+            Some(server) if server.domain_id == *source.tmux_server_id() => Ok(()),
+            Some(_) => Err("cross-server History jump is unavailable from this viewer".into()),
+            None => Err("History jump requires an explicit tmux server".into()),
+        },
+        move |source: &SourceContext| {
+            let server = jump_server
+                .as_ref()
+                .ok_or_else(|| "History jump requires an explicit tmux server".to_owned())?;
+            let mut backend = ProductionBackend::connect(server.server.clone(), &executable)
+                .map_err(|error| error.to_string())?;
+            backend
+                .jump(&JumpTarget {
+                    pane_id: PaneId(source.pane_id().to_owned()),
+                    likely_client: None,
+                })
+                .map_err(|error| error.to_string())
+        },
+    );
+    match run_history_terminal(launch, arguments.all, actions)? {
+        HistoryOutcome::Jumped {
+            warning: Some(warning),
+        } => eprintln!("warning: {warning}"),
+        HistoryOutcome::Closed | HistoryOutcome::Interrupted | HistoryOutcome::Jumped { .. } => {}
+    }
+    Ok(())
+}
+
 fn wire_selector(selector: &Selector) -> WireSelector {
     WireSelector {
         id: selector.id.clone(),
@@ -426,7 +532,7 @@ async fn run_history(
     let server_id = selected
         .map(|server| server.domain_id.clone())
         .unwrap_or_else(|| TmuxServerId::new("all-servers").expect("fixed ID is valid"));
-    let history = History::open(&paths.history_file, server_id, &config.history, Utc::now())?;
+    let history = History::open_reader(&paths.history_file, server_id, &config.history)?;
     if let Some(HistoryAction::Clear(mut clear)) = arguments.action {
         clear.all_servers |= arguments.all_servers;
         return clear_history(&history, clear).await;
@@ -616,6 +722,12 @@ async fn run_daemon(
     config: Config,
 ) -> Result<(), RuntimeAppError> {
     paths.ensure_private_directories()?;
+    let environment = Environment::current();
+    let term_is_dumb = environment.get("TERM").is_some_and(|value| value == "dumb");
+    let unicode = config.display.unicode != FeatureMode::Never && !term_is_dumb;
+    let color = config.display.color != FeatureMode::Never
+        && !term_is_dumb
+        && environment.get("NO_COLOR").is_none();
     let executable = std::env::current_exe()?;
     let mut production = ProductionBackend::connect(selected.server.clone(), executable)?;
     production.capabilities()?;
@@ -665,10 +777,15 @@ async fn run_daemon(
         Arc::clone(&stopping),
         origin,
         WindowDisplayPolicy {
+            placement: config.toast.position,
             toast_width: u16::try_from(config.toast.width).unwrap_or(u16::MAX),
             toast_height: u16::try_from(config.toast.height).unwrap_or(u16::MAX),
             toast_gap: u16::try_from(config.toast.gap).unwrap_or(u16::MAX),
             max_visible_toasts: usize::try_from(config.toast.max_visible).unwrap_or(100),
+            stack_order: config.toast.stack_order,
+            body: config.toast.body,
+            unicode,
+            color,
         },
     ));
     let handler_service = service.clone();
@@ -737,8 +854,17 @@ async fn reconcile_loop(
             let _ = reconciler.tick(&mut *backend, &mut scheduler, monotonic(origin), Utc::now());
             scheduler.drain_closed()
         };
-        persist_all(&history, snapshots).await;
+        enqueue_all(&history, snapshots);
         tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+fn enqueue_all(history: &History, snapshots: Vec<crate::notification::Notification>) {
+    for notification in snapshots {
+        // The worker owns SQLite retries. Dropping the receipt here keeps the
+        // display loop independent from database latency while retaining the
+        // bounded History channel as backpressure.
+        let _ = history.persist(&notification);
     }
 }
 
@@ -857,6 +983,8 @@ pub enum RuntimeAppError {
     MissingTmuxTarget,
     #[error("History outside tmux requires -L, -S, or --all-servers")]
     MissingHistoryTarget,
+    #[error("History inside tmux requires a valid current Source Pane")]
+    HistorySourceUnavailable,
     #[error("non-interactive History Clear requires --yes")]
     ConfirmationRequired,
     #[error("invalid --before age {0:?}; use a positive m, h, or d duration")]
@@ -879,6 +1007,8 @@ pub enum RuntimeAppError {
     History(#[from] HistoryError),
     #[error(transparent)]
     HistoryOutput(#[from] crate::history::HistoryOutputError),
+    #[error(transparent)]
+    HistoryUi(#[from] crate::ui::history::HistoryUiError),
     #[error(transparent)]
     Hook(#[from] HookError),
     #[error(transparent)]
@@ -999,5 +1129,25 @@ mod tests {
         assert!(parse_age("30").is_err());
         assert!(parse_age("forever").is_err());
         assert!(parse_age("18446744073709551615d").is_err());
+    }
+
+    #[test]
+    fn history_defaults_to_tui_but_preserves_scriptable_output_modes() {
+        let arguments = HistoryArgs {
+            action: None,
+            plain: false,
+            json: false,
+            all: false,
+            all_servers: false,
+        };
+        assert_eq!(history_mode(&arguments, true, true), HistoryMode::Floating);
+        assert_eq!(history_mode(&arguments, true, false), HistoryMode::Terminal);
+        assert_eq!(history_mode(&arguments, false, true), HistoryMode::Output);
+
+        let plain = HistoryArgs {
+            plain: true,
+            ..arguments
+        };
+        assert_eq!(history_mode(&plain, true, true), HistoryMode::Output);
     }
 }
