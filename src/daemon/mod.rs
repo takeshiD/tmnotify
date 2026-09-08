@@ -6,8 +6,8 @@
 //! after that boundary reports a successful pane switch.
 
 mod reconcile;
-mod service;
 pub mod runtime;
+mod service;
 
 pub use reconcile::{
     ReconcileError, ReconcileOutcome, ReconcileStatus, WindowDisplayPolicy, WindowReconciler,
