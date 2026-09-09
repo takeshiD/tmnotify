@@ -7,7 +7,7 @@
 
 use std::future::Future;
 use std::io;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -19,7 +19,7 @@ use tokio::sync::{Mutex, oneshot, watch};
 
 use super::runtime::{
     OwnedSocket, RuntimeError, RuntimeLimits, RuntimeShutdown, ServerIdentity,
-    SessionRendererBroker, serve_with_renderers_and_force_shutdown,
+    SessionRendererBroker, serve_with_renderers_and_force_shutdown, submit_existing,
 };
 use super::{
     DaemonService, JumpExecutor, LiveScheduler, MonotonicTime, SchedulerError, SchedulerLimits,
@@ -29,7 +29,10 @@ use crate::config::{Config, ConfigManager, ConfigOverrides, FeatureMode, ReloadO
 use crate::history::{History, HistoryError};
 use crate::notification::{Notification, SourceContext, TmuxServerId};
 use crate::platform::{Environment, LogEvent, LogLevel, PathError, PlatformPaths, PrivateLogger};
-use crate::protocol::RendererAction;
+use crate::protocol::{
+    ClientCommand, ClientRequest, ClientResponse, ProtocolError, RendererAction, WireSourceContext,
+    decode_client_response,
+};
 use crate::tmux::{
     Backend as _, DisplayPlan, Error as TmuxError, JumpTarget, PaneId, ProductionBackend, Server,
     WindowId,
@@ -37,6 +40,128 @@ use crate::tmux::{
 
 const CONFIG_RELOAD_INTERVAL: Duration = Duration::from_secs(1);
 const MAX_IDLE_TICK: Duration = Duration::from_millis(50);
+
+/// Deep client boundary used by the interactive History process. Daemon
+/// sockets, protocol messages, cross-server routing, and direct fallback tmux
+/// ownership stay inside the daemon module.
+#[derive(Clone)]
+pub struct HistoryActionClient {
+    paths: PlatformPaths,
+    current_server: Option<(TmuxServerId, Server)>,
+    executable: PathBuf,
+}
+
+impl HistoryActionClient {
+    pub fn new(
+        paths: PlatformPaths,
+        current_server: Option<(TmuxServerId, Server)>,
+    ) -> Result<Self, HistoryActionError> {
+        let executable = std::env::current_exe().map_err(|error| {
+            HistoryActionError(format!("current executable is unavailable: {error}"))
+        })?;
+        Ok(Self {
+            paths,
+            current_server,
+            executable,
+        })
+    }
+
+    pub async fn ensure_open_allowed(&self) -> Result<(), HistoryActionError> {
+        let Some((server_id, _)) = &self.current_server else {
+            return Ok(());
+        };
+        let socket = self
+            .paths
+            .socket_path(server_id.as_str())
+            .map_err(history_action_error)?;
+        match history_daemon_request(&socket, ClientCommand::HistoryGuard).await {
+            Ok(_) | Err(HistoryRequestError::Unavailable(_)) => Ok(()),
+            Err(error) => Err(history_action_error(error)),
+        }
+    }
+
+    pub async fn jump(&self, source: &SourceContext) -> Result<(), HistoryActionError> {
+        let socket = self
+            .paths
+            .socket_path(source.tmux_server_id().as_str())
+            .map_err(history_action_error)?;
+        let command = ClientCommand::HistoryJump {
+            source: WireSourceContext::from_domain(source),
+        };
+        match history_daemon_request(&socket, command).await {
+            Ok(_) => Ok(()),
+            Err(HistoryRequestError::Unavailable(_))
+                if self
+                    .current_server
+                    .as_ref()
+                    .is_some_and(|(server_id, _)| server_id == source.tmux_server_id()) =>
+            {
+                let (_, server) = self.current_server.as_ref().expect("server ID was matched");
+                let mut backend = ProductionBackend::connect(server.clone(), &self.executable)
+                    .map_err(history_action_error)?;
+                backend
+                    .jump(&JumpTarget {
+                        pane_id: PaneId(source.pane_id().to_owned()),
+                        likely_client: None,
+                    })
+                    .map_err(history_action_error)
+            }
+            Err(HistoryRequestError::Unavailable(error)) => Err(HistoryActionError(format!(
+                "Target tmux server is unavailable; start or attach it and retry ({error})"
+            ))),
+            Err(error) => Err(history_action_error(error)),
+        }
+    }
+}
+
+#[derive(Debug, Error)]
+#[error("{0}")]
+pub struct HistoryActionError(String);
+
+fn history_action_error(error: impl std::fmt::Display) -> HistoryActionError {
+    HistoryActionError(error.to_string())
+}
+
+async fn history_daemon_request(
+    socket: &Path,
+    command: ClientCommand,
+) -> Result<serde_json::Value, HistoryRequestError> {
+    let request = ClientRequest::new(command);
+    let payload = serde_json::to_vec(&request).map_err(HistoryRequestError::Encode)?;
+    let frame = submit_existing(socket, &payload)
+        .await
+        .map_err(|error| match error {
+            RuntimeError::Connect(source)
+                if matches!(
+                    source.kind(),
+                    io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused
+                ) =>
+            {
+                HistoryRequestError::Unavailable(source)
+            }
+            error => HistoryRequestError::Transport(error),
+        })?;
+    match decode_client_response(&frame, request.request_id)
+        .map_err(HistoryRequestError::Protocol)?
+    {
+        ClientResponse::Success(value) => Ok(value),
+        ClientResponse::Error(message) => Err(HistoryRequestError::Remote(message)),
+    }
+}
+
+#[derive(Debug, Error)]
+enum HistoryRequestError {
+    #[error("tmnotify daemon is unavailable: {0}")]
+    Unavailable(io::Error),
+    #[error("tmnotify daemon request failed: {0}")]
+    Transport(RuntimeError),
+    #[error("tmnotify daemon protocol failed: {0}")]
+    Protocol(ProtocolError),
+    #[error("tmnotify daemon rejected the action: {0}")]
+    Remote(String),
+    #[error("failed to encode tmnotify daemon request: {0}")]
+    Encode(serde_json::Error),
+}
 
 /// Runs the complete daemon application for one selected tmux server.
 ///
@@ -461,6 +586,7 @@ mod tests {
     #[cfg(unix)]
     use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
     use std::path::Path;
+    use std::sync::Mutex as StdMutex;
 
     use tempfile::TempDir;
 
@@ -589,6 +715,73 @@ mod tests {
             std::fs::read_to_string(log_path)
                 .unwrap()
                 .contains("event=config_invalid")
+        );
+    }
+
+    #[tokio::test]
+    async fn history_actions_route_cross_server_jump_and_report_disconnect() {
+        let temporary = TempDir::new().unwrap();
+        #[cfg(unix)]
+        std::fs::set_permissions(temporary.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let environment = Environment::from_pairs([
+            (
+                OsString::from("HOME"),
+                temporary.path().as_os_str().to_owned(),
+            ),
+            (
+                OsString::from("XDG_RUNTIME_DIR"),
+                temporary.path().join("runtime").into_os_string(),
+            ),
+            (
+                OsString::from("XDG_CONFIG_HOME"),
+                temporary.path().join("config").into_os_string(),
+            ),
+            (
+                OsString::from("XDG_STATE_HOME"),
+                temporary.path().join("state").into_os_string(),
+            ),
+        ]);
+        let paths = PlatformPaths::resolve(&environment).unwrap();
+        paths.ensure_private_directories().unwrap();
+        let socket = paths.socket_path("target").unwrap();
+        let owned = OwnedSocket::bind(&socket).unwrap();
+        let observed = Arc::new(StdMutex::new(Vec::new()));
+        let handler_observed = Arc::clone(&observed);
+        let (shutdown_tx, shutdown_rx) = oneshot::channel();
+        let server_task = tokio::spawn(super::super::runtime::serve(
+            owned,
+            RuntimeLimits::default(),
+            move |envelope| {
+                let observed = Arc::clone(&handler_observed);
+                async move {
+                    let request = ClientRequest::from_envelope(&envelope)
+                        .map_err(|error| error.to_string())?;
+                    let ClientCommand::HistoryJump { source } = request.command else {
+                        return Err("unexpected command".to_owned());
+                    };
+                    observed.lock().unwrap().push(source.pane_id);
+                    Ok(serde_json::json!({ "jumped": true }))
+                }
+            },
+            async move { shutdown_rx.await.unwrap() },
+            |_| async {},
+        ));
+        let client = HistoryActionClient::new(paths, None).unwrap();
+        let source =
+            SourceContext::new(TmuxServerId::new("target").unwrap(), "$1", "@2", "%37").unwrap();
+
+        client.jump(&source).await.unwrap();
+        assert_eq!(observed.lock().unwrap().as_slice(), &["%37"]);
+
+        shutdown_tx.send(RuntimeShutdown::Signal).unwrap();
+        server_task.await.unwrap().unwrap();
+        assert!(
+            client
+                .jump(&source)
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("unavailable")
         );
     }
 }

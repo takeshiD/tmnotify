@@ -851,6 +851,17 @@ pub async fn submit_lazy(
     Err(RuntimeError::StartupTimedOut)
 }
 
+/// Submits to an already-running daemon without starting one. History uses
+/// this for cross-server actions because a persisted server ID identifies the
+/// daemon socket, but intentionally does not retain a tmux socket path that
+/// could be used to start that server again.
+pub async fn submit_existing(socket: &Path, request: &[u8]) -> Result<Vec<u8>, RuntimeError> {
+    if request.len() > MAX_REQUEST_BYTES {
+        return Err(RuntimeError::RequestTooLarge);
+    }
+    exchange(socket, request).await
+}
+
 async fn exchange(socket: &Path, request: &[u8]) -> Result<Vec<u8>, RuntimeError> {
     let mut stream = UnixStream::connect(socket)
         .await

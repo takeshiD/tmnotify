@@ -30,6 +30,8 @@ pub enum RequestKind {
     Dismiss,
     Jump,
     History,
+    HistoryGuard,
+    HistoryJump,
     HistoryClear,
     RendererRedeem,
 }
@@ -42,6 +44,8 @@ impl RequestKind {
             "dismiss" => Some(Self::Dismiss),
             "jump" => Some(Self::Jump),
             "history" => Some(Self::History),
+            "history-guard" => Some(Self::HistoryGuard),
+            "history-jump" => Some(Self::HistoryJump),
             "history-clear" => Some(Self::HistoryClear),
             "renderer-redeem" => Some(Self::RendererRedeem),
             _ => None,
@@ -197,6 +201,10 @@ pub enum ClientCommand {
         all_servers: bool,
         limit: u32,
     },
+    HistoryGuard,
+    HistoryJump {
+        source: WireSourceContext,
+    },
     HistoryClear {
         selector: WireHistoryClear,
         all_servers: bool,
@@ -211,6 +219,8 @@ impl ClientCommand {
             Self::Dismiss { .. } => RequestKind::Dismiss,
             Self::Jump { .. } => RequestKind::Jump,
             Self::History { .. } => RequestKind::History,
+            Self::HistoryGuard => RequestKind::HistoryGuard,
+            Self::HistoryJump { .. } => RequestKind::HistoryJump,
             Self::HistoryClear { .. } => RequestKind::HistoryClear,
         }
     }
@@ -233,7 +243,8 @@ impl ClientCommand {
             Self::History { limit, .. } if *limit == 0 || *limit > 100_000 => {
                 Err(ProtocolError::InvalidHistoryLimit)
             }
-            Self::History { .. } | Self::HistoryClear { .. } => Ok(()),
+            Self::HistoryJump { source } => source.clone().into_domain().map(|_| ()),
+            Self::History { .. } | Self::HistoryGuard | Self::HistoryClear { .. } => Ok(()),
         }
     }
 }
@@ -352,7 +363,8 @@ pub struct WireSourceContext {
 }
 
 impl WireSourceContext {
-    fn from_domain(source: &SourceContext) -> Self {
+    #[must_use]
+    pub fn from_domain(source: &SourceContext) -> Self {
         Self {
             provider: source.provider(),
             provider_session_id: source.provider_session_id().map(str::to_owned),
@@ -366,7 +378,7 @@ impl WireSourceContext {
         }
     }
 
-    fn into_domain(self) -> Result<SourceContext, ProtocolError> {
+    pub(crate) fn into_domain(self) -> Result<SourceContext, ProtocolError> {
         let mut source = SourceContext::new(
             TmuxServerId::new(&self.tmux_server_id)?,
             &self.session_id,

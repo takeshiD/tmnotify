@@ -633,6 +633,11 @@ impl LiveScheduler {
     }
 
     #[must_use]
+    pub(crate) fn has_active_attention(&self) -> bool {
+        self.active_attention.is_some()
+    }
+
+    #[must_use]
     pub fn notification(&self, id: NotificationId) -> Option<&Notification> {
         self.entries.get(&id).map(|entry| &entry.notification)
     }

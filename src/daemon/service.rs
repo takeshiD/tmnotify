@@ -258,6 +258,21 @@ impl<J: JumpExecutor> DaemonService<J> {
                     .await?;
                 Ok(ServiceResponse::data(serde_json::to_value(entries)?))
             }
+            ClientCommand::HistoryGuard => {
+                self.ensure_history_action_allowed().await?;
+                Ok(ServiceResponse::data(
+                    serde_json::json!({ "attention_active": false }),
+                ))
+            }
+            ClientCommand::HistoryJump { source } => {
+                let source = source.into_domain()?;
+                if source.tmux_server_id() != self.history.current_server() {
+                    return Err(ServiceError::HistoryServerMismatch);
+                }
+                self.ensure_history_action_allowed().await?;
+                self.jump.jump(source).await.map_err(ServiceError::Jump)?;
+                Ok(ServiceResponse::data(serde_json::json!({ "jumped": true })))
+            }
             ClientCommand::HistoryClear {
                 selector,
                 all_servers,
@@ -275,6 +290,14 @@ impl<J: JumpExecutor> DaemonService<J> {
                     serde_json::json!({ "deleted": count }),
                 ))
             }
+        }
+    }
+
+    async fn ensure_history_action_allowed(&self) -> Result<(), ServiceError> {
+        if self.scheduler.lock().await.has_active_attention() {
+            Err(ServiceError::HistoryAttentionActive)
+        } else {
+            Ok(())
         }
     }
 
@@ -399,6 +422,10 @@ pub enum ServiceError {
     InvalidWindowDisplay,
     #[error("renderer actions are valid only for an Attention Gate")]
     RendererActionNotAttention,
+    #[error("History cannot open or jump while an Attention Gate is active")]
+    HistoryAttentionActive,
+    #[error("History Source Pane belongs to a different tmux server")]
+    HistoryServerMismatch,
 }
 
 #[cfg(test)]
@@ -625,6 +652,82 @@ mod tests {
                 .notification(sent.notification_id.unwrap())
                 .is_some()
         );
+    }
+
+    #[tokio::test]
+    async fn history_guard_and_jump_refuse_active_attention_without_switching() {
+        let temporary = TempDir::new().unwrap();
+        let service = service(&temporary, FakeJump::default());
+        let (mono, wall) = times();
+        service
+            .scheduler
+            .lock()
+            .await
+            .set_display_available(true, mono, wall)
+            .unwrap();
+        service.handle(attention_send(), mono, wall).await.unwrap();
+
+        assert!(matches!(
+            service
+                .handle(ClientCommand::HistoryGuard, mono, wall)
+                .await,
+            Err(ServiceError::HistoryAttentionActive)
+        ));
+        assert!(matches!(
+            service
+                .handle(
+                    ClientCommand::HistoryJump {
+                        source: crate::protocol::WireSourceContext::from_domain(&source()),
+                    },
+                    mono,
+                    wall,
+                )
+                .await,
+            Err(ServiceError::HistoryAttentionActive)
+        ));
+        assert!(service.jump.sources.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn history_jump_validates_server_and_keeps_source_failure_nonfatal() {
+        let temporary = TempDir::new().unwrap();
+        let service = service(
+            &temporary,
+            FakeJump {
+                fail: true,
+                ..FakeJump::default()
+            },
+        );
+        let (mono, wall) = times();
+        let wrong =
+            SourceContext::new(TmuxServerId::new("other").unwrap(), "$1", "@2", "%3").unwrap();
+        assert!(matches!(
+            service
+                .handle(
+                    ClientCommand::HistoryJump {
+                        source: crate::protocol::WireSourceContext::from_domain(&wrong),
+                    },
+                    mono,
+                    wall,
+                )
+                .await,
+            Err(ServiceError::HistoryServerMismatch)
+        ));
+        assert!(service.jump.sources.lock().unwrap().is_empty());
+
+        assert!(matches!(
+            service
+                .handle(
+                    ClientCommand::HistoryJump {
+                        source: crate::protocol::WireSourceContext::from_domain(&source()),
+                    },
+                    mono,
+                    wall,
+                )
+                .await,
+            Err(ServiceError::Jump(message)) if message == "pane missing"
+        ));
+        assert_eq!(service.jump.sources.lock().unwrap().as_slice(), &[source()]);
     }
 
     #[tokio::test]

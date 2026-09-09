@@ -1165,7 +1165,7 @@ mod tests {
 
     #[test]
     #[ignore = "requires the pinned tmux next-3.8 capability surface and util-linux script"]
-    fn isolated_jump_resolves_source_pane_after_it_moves() {
+    fn isolated_cross_server_history_jump_resolves_source_pane_after_it_moves() {
         struct ServerGuard(PathBuf);
         impl Drop for ServerGuard {
             fn drop(&mut self) {
@@ -1193,6 +1193,27 @@ mod tests {
         }
 
         let directory = tempfile::tempdir().unwrap();
+        let viewer_socket = directory.path().join("viewer.sock");
+        let viewer_status = Command::new("tmux")
+            .arg("-S")
+            .arg(&viewer_socket)
+            .arg("-f")
+            .arg("/dev/null")
+            .args(["new-session", "-d", "-s", "tmnotify-viewer", "sleep 30"])
+            .status()
+            .unwrap();
+        assert!(viewer_status.success());
+        let _viewer_guard = ServerGuard(viewer_socket.clone());
+        let viewer_pane = tmux(
+            &viewer_socket,
+            &[
+                "display-message",
+                "-p",
+                "-t",
+                "tmnotify-viewer",
+                "#{pane_id}",
+            ],
+        );
         let socket = directory.path().join("jump.sock");
         let status = Command::new("tmux")
             .arg("-S")
@@ -1297,6 +1318,20 @@ mod tests {
             ],
         );
         assert_eq!(selected, format!("{target_window}\t{source_pane}"));
+        assert_eq!(
+            tmux(
+                &viewer_socket,
+                &[
+                    "display-message",
+                    "-p",
+                    "-t",
+                    "tmnotify-viewer",
+                    "#{pane_id}"
+                ],
+            ),
+            viewer_pane,
+            "cross-server jump must target only the Source Pane server",
+        );
 
         let _ = attached.kill();
         let _ = attached.wait();

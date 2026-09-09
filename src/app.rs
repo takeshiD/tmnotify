@@ -15,6 +15,7 @@ use crate::cli::{
     Selector, TmuxTarget,
 };
 use crate::config::{Config, ConfigOverrides, FeatureMode, HooksConfig, TimeoutValue, load};
+use crate::daemon::application::HistoryActionClient;
 use crate::daemon::runtime::{RuntimeError, ServerIdentity, submit_lazy};
 use crate::doctor::{DoctorOutputError, HookObservation, SystemProbe};
 use crate::history::{ClearFilter, History, HistoryError, HistoryQuery, write_ndjson, write_plain};
@@ -27,7 +28,7 @@ use crate::protocol::{
 };
 use crate::providers::HookPolicy;
 use crate::renderer_runtime::{RendererKind, RendererRuntimeError, run_hidden_renderer};
-use crate::tmux::{Backend as _, JumpTarget, PaneId, ProductionBackend, Server};
+use crate::tmux::Server;
 use crate::ui::history::{
     HistoryActions, HistoryLaunch, HistoryOutcome, OutsideTmuxScope,
     run_with_options as run_history_terminal,
@@ -254,7 +255,8 @@ pub async fn run(cli: Cli) -> Result<(), RuntimeAppError> {
         Command::History(arguments) => {
             match history_mode(&arguments, io::stdout().is_terminal(), inside_tmux) {
                 HistoryMode::Floating => {
-                    launch_history_pane(arguments, require_server(selected)?, &environment)?;
+                    launch_history_pane(arguments, require_server(selected)?, &paths, &environment)
+                        .await?;
                     Ok(())
                 }
                 HistoryMode::Terminal => {
@@ -389,11 +391,18 @@ fn history_mode(arguments: &HistoryArgs, stdout_terminal: bool, inside_tmux: boo
     }
 }
 
-fn launch_history_pane(
+async fn launch_history_pane(
     arguments: HistoryArgs,
     selected: SelectedServer,
+    paths: &PlatformPaths,
     environment: &Environment,
 ) -> Result<(), RuntimeAppError> {
+    HistoryActionClient::new(
+        paths.clone(),
+        Some((selected.domain_id.clone(), selected.server.clone())),
+    )?
+    .ensure_open_allowed()
+    .await?;
     let source =
         capture_source(&selected, environment)?.ok_or(RuntimeAppError::HistorySourceUnavailable)?;
     let executable = std::env::current_exe()?;
@@ -431,28 +440,26 @@ fn run_interactive_history(
         None => HistoryLaunch::OutsideTmux(OutsideTmuxScope::AllServers),
     };
 
-    let guard_server = selected.clone();
-    let jump_server = selected;
-    let executable = std::env::current_exe()?;
+    let daemon_actions = HistoryActionClient::new(
+        paths.clone(),
+        selected
+            .as_ref()
+            .map(|server| (server.domain_id.clone(), server.server.clone())),
+    )?;
+    let guard_actions = daemon_actions.clone();
+    let runtime = tokio::runtime::Handle::current();
+    let guard_runtime = runtime.clone();
     let actions = HistoryActions::new(
         history,
-        || Ok(()),
-        move |source: &SourceContext| match &guard_server {
-            Some(server) if server.domain_id == *source.tmux_server_id() => Ok(()),
-            Some(_) => Err("cross-server History jump is unavailable from this viewer".into()),
-            None => Err("History jump requires an explicit tmux server".into()),
+        move || {
+            guard_runtime
+                .block_on(guard_actions.ensure_open_allowed())
+                .map_err(|error| error.to_string())
         },
+        |_source: &SourceContext| Ok(()),
         move |source: &SourceContext| {
-            let server = jump_server
-                .as_ref()
-                .ok_or_else(|| "History jump requires an explicit tmux server".to_owned())?;
-            let mut backend = ProductionBackend::connect(server.server.clone(), &executable)
-                .map_err(|error| error.to_string())?;
-            backend
-                .jump(&JumpTarget {
-                    pane_id: PaneId(source.pane_id().to_owned()),
-                    likely_client: None,
-                })
+            runtime
+                .block_on(daemon_actions.jump(source))
                 .map_err(|error| error.to_string())
         },
     );
@@ -765,6 +772,8 @@ pub enum RuntimeAppError {
     Execution(String),
     #[error(transparent)]
     App(#[from] AppError),
+    #[error(transparent)]
+    HistoryAction(#[from] crate::daemon::application::HistoryActionError),
     #[error(transparent)]
     Cli(#[from] crate::cli::CliError),
     #[error(transparent)]

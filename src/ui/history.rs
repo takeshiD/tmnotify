@@ -1055,6 +1055,54 @@ mod tests {
             view.handle_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE)),
             Some(HistoryAction::Jump { id: selected, .. }) if selected == id
         ));
+
+        let remote = entry("beta", "remote", "done", true);
+        let mut view = HistoryView::new(vec![remote], server("alpha"));
+        assert!(
+            view.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+                .is_none()
+        );
+        assert!(
+            view.handle_key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE))
+                .is_none()
+        );
+        assert_eq!(view.confirmation, None);
+    }
+
+    #[test]
+    fn failed_jump_is_a_nonfatal_status_and_view_remains_operable() {
+        let item = entry("alpha", "Build", "done", true);
+        let mut view = HistoryView::new(vec![item], server("alpha"));
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let bridge = ActionBridge::spawn(FakeActions {
+            entries: Vec::new(),
+            calls,
+            open_error: None,
+            jump_error: Some("Source Pane no longer exists; refresh History and retry".into()),
+        })
+        .unwrap();
+        let action = view
+            .handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .unwrap();
+        let HistoryAction::Jump { id, source } = action else {
+            panic!("Enter must request a jump")
+        };
+        bridge.submit(WorkerCommand::Jump(id, source)).unwrap();
+        for _ in 0..100 {
+            apply_worker_replies(&mut view, &bridge).unwrap();
+            if view.status.is_some() {
+                break;
+            }
+            thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(
+            view.status.as_deref(),
+            Some("Source Pane no longer exists; refresh History and retry")
+        );
+        assert_eq!(
+            view.handle_key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE)),
+            Some(HistoryAction::Quit)
+        );
     }
 
     #[test]

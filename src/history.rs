@@ -180,6 +180,7 @@ pub enum ClearFilter {
 /// Concrete SQLite History module for one daemon/current-server context.
 pub struct History {
     enabled: bool,
+    current_server: TmuxServerId,
     sender: Option<SyncSender<Command>>,
 }
 
@@ -222,6 +223,7 @@ impl History {
         if !config.enabled {
             return Ok(Self {
                 enabled: false,
+                current_server,
                 sender: None,
             });
         }
@@ -240,11 +242,11 @@ impl History {
         enforce_retention(&connection, config.max_entries)?;
 
         let (sender, receiver) = mpsc::sync_channel(queue_capacity.max(1));
-        let server = current_server;
+        let worker_server = current_server.clone();
         let max_entries = config.max_entries;
         thread::Builder::new()
             .name("tmnotify-history".to_owned())
-            .spawn(move || worker_loop(connection, receiver, server, max_entries))
+            .spawn(move || worker_loop(connection, receiver, worker_server, max_entries))
             .map_err(|source| HistoryError::Io {
                 path: path.to_owned(),
                 source,
@@ -252,6 +254,7 @@ impl History {
 
         Ok(Self {
             enabled: true,
+            current_server,
             sender: Some(sender),
         })
     }
@@ -259,6 +262,11 @@ impl History {
     #[must_use]
     pub fn is_enabled(&self) -> bool {
         self.enabled
+    }
+
+    #[must_use]
+    pub(crate) fn current_server(&self) -> &TmuxServerId {
+        &self.current_server
     }
 
     /// Inserts a row at acceptance or updates the same Notification snapshot.
