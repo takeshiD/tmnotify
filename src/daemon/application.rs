@@ -15,7 +15,7 @@ use std::time::{Duration, Instant};
 
 use chrono::Utc;
 use thiserror::Error;
-use tokio::sync::{Mutex, oneshot};
+use tokio::sync::{Mutex, oneshot, watch};
 
 use super::runtime::{
     OwnedSocket, RuntimeError, RuntimeLimits, RuntimeShutdown, ServerIdentity,
@@ -23,17 +23,20 @@ use super::runtime::{
 };
 use super::{
     DaemonService, JumpExecutor, LiveScheduler, MonotonicTime, SchedulerError, SchedulerLimits,
-    ShutdownReason, WindowDisplayPolicy, WindowReconciler,
+    ShutdownReason, ToastAnimationPolicy, WindowDisplayPolicy, WindowReconciler,
 };
-use crate::config::{Config, FeatureMode};
+use crate::config::{Config, ConfigManager, ConfigOverrides, FeatureMode, ReloadOutcome};
 use crate::history::{History, HistoryError};
 use crate::notification::{Notification, SourceContext, TmuxServerId};
-use crate::platform::{Environment, PathError, PlatformPaths};
+use crate::platform::{Environment, LogEvent, LogLevel, PathError, PlatformPaths, PrivateLogger};
 use crate::protocol::RendererAction;
 use crate::tmux::{
     Backend as _, DisplayPlan, Error as TmuxError, JumpTarget, PaneId, ProductionBackend, Server,
     WindowId,
 };
+
+const CONFIG_RELOAD_INTERVAL: Duration = Duration::from_secs(1);
+const MAX_IDLE_TICK: Duration = Duration::from_millis(50);
 
 /// Runs the complete daemon application for one selected tmux server.
 ///
@@ -47,11 +50,27 @@ pub async fn run(server: Server, paths: PlatformPaths, config: Config) -> Result
 async fn run_inner(
     server: Server,
     paths: PlatformPaths,
-    config: Config,
+    _startup_config: Config,
 ) -> Result<(), ApplicationFailure> {
     paths.ensure_private_directories()?;
     let environment = Environment::current();
+    let config_manager = ConfigManager::new(
+        paths.config_file.clone(),
+        environment.clone(),
+        ConfigOverrides::default(),
+    )?;
+    let config = config_manager.active().clone();
     let settings = DaemonSettings::from_config(&config, &environment)?;
+    let config_manager = Arc::new(Mutex::new(config_manager));
+    let logger = Arc::new(PrivateLogger::new(paths.log_file.clone())?);
+    let (settings_sender, settings_receiver) = watch::channel(settings);
+    let config_reload = LiveConfigReload {
+        manager: Arc::clone(&config_manager),
+        settings_sender,
+        logger,
+        environment: environment.clone(),
+        interval: CONFIG_RELOAD_INTERVAL,
+    };
     let identity = ServerIdentity::resolve(server.socket_path())?;
     let daemon_socket = paths.socket_path(identity.server_id())?;
     let domain_id = TmuxServerId::new(identity.server_id())?;
@@ -101,12 +120,18 @@ async fn run_inner(
         Arc::clone(&history),
         Arc::clone(&stopping),
         origin,
-        settings.display_policy,
+        DaemonDisplayRuntime {
+            settings,
+            settings_receiver,
+            config_reload: config_reload.clone(),
+        },
     ));
     let handler_service = service.clone();
     let handler = move |envelope| {
         let service = handler_service.clone();
+        let config_reload = config_reload.clone();
         async move {
+            config_reload.reload().await;
             service
                 .handle_envelope(&envelope, monotonic(origin), Utc::now())
                 .await
@@ -221,6 +246,14 @@ impl DaemonSettings {
                 body: config.toast.body,
                 unicode,
                 color,
+                animation: ToastAnimationPolicy {
+                    enabled: config.toast.animation.enabled && !term_is_dumb,
+                    fps: config.toast.animation.fps,
+                    enter_duration: config.toast.animation.enter_duration.0,
+                    exit_duration: config.toast.animation.exit_duration.0,
+                    enter_easing: config.toast.animation.enter_easing,
+                    exit_easing: config.toast.animation.exit_easing,
+                },
             },
         })
     }
@@ -232,19 +265,77 @@ async fn reconcile_loop(
     history: Arc<History>,
     stopping: Arc<AtomicBool>,
     origin: Instant,
-    policy: WindowDisplayPolicy,
+    mut display: DaemonDisplayRuntime,
 ) {
-    let mut reconciler = WindowReconciler::new(policy, MonotonicTime::default());
+    let mut reconciler =
+        WindowReconciler::new(display.settings.display_policy, MonotonicTime::default());
+    let mut pending_limits = None;
+    let mut next_config_reload = Instant::now() + display.config_reload.interval;
     while !stopping.load(Ordering::Acquire) {
+        if Instant::now() >= next_config_reload {
+            display.config_reload.reload().await;
+            next_config_reload = Instant::now() + display.config_reload.interval;
+        }
+        if display.settings_receiver.has_changed().unwrap_or(false) {
+            let settings = *display.settings_receiver.borrow_and_update();
+            reconciler.update_policy(settings.display_policy);
+            pending_limits = Some(settings.scheduler_limits);
+        }
         let snapshots = {
             let mut backend = backend.lock().await;
             let mut scheduler = scheduler.lock().await;
+            if let Some(limits) = pending_limits.take() {
+                let _ = scheduler.update_limits(limits, monotonic(origin), Utc::now());
+            }
             let _ = reconciler.tick(&mut *backend, &mut scheduler, monotonic(origin), Utc::now());
             scheduler.drain_closed()
         };
         enqueue_all(&history, snapshots);
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        tokio::time::sleep(reconciler.frame_interval().min(MAX_IDLE_TICK)).await;
     }
+}
+
+#[derive(Clone)]
+struct LiveConfigReload {
+    manager: Arc<Mutex<ConfigManager>>,
+    settings_sender: watch::Sender<DaemonSettings>,
+    logger: Arc<PrivateLogger>,
+    environment: Environment,
+    interval: Duration,
+}
+
+impl LiveConfigReload {
+    async fn reload(&self) {
+        let update = {
+            let mut manager = self.manager.lock().await;
+            match manager.reload_if_changed() {
+                Ok(ReloadOutcome::Reloaded(changes))
+                    if changes.display_reconciliation || changes.daemon_or_queue =>
+                {
+                    Some(DaemonSettings::from_config(
+                        manager.active(),
+                        &self.environment,
+                    ))
+                }
+                Ok(ReloadOutcome::Rejected) | Err(_) => {
+                    let _ = self
+                        .logger
+                        .write(LogLevel::Warning, LogEvent::InvalidConfiguration);
+                    None
+                }
+                Ok(ReloadOutcome::Unchanged | ReloadOutcome::Reloaded(_)) => None,
+            }
+        };
+        if let Some(Ok(settings)) = update {
+            self.settings_sender.send_replace(settings);
+        }
+    }
+}
+
+struct DaemonDisplayRuntime {
+    settings: DaemonSettings,
+    settings_receiver: watch::Receiver<DaemonSettings>,
+    config_reload: LiveConfigReload,
 }
 
 fn enqueue_all(history: &History, snapshots: Vec<Notification>) {
@@ -345,6 +436,8 @@ pub struct Error(#[from] ApplicationFailure);
 #[derive(Debug, Error)]
 enum ApplicationFailure {
     #[error(transparent)]
+    Config(#[from] crate::config::ConfigError),
+    #[error(transparent)]
     Path(#[from] PathError),
     #[error(transparent)]
     Runtime(#[from] RuntimeError),
@@ -363,9 +456,29 @@ enum ApplicationFailure {
 #[cfg(test)]
 mod tests {
     use std::ffi::OsString;
+    use std::fs::OpenOptions;
+    use std::io::Write as _;
+    #[cfg(unix)]
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+    use std::path::Path;
+
+    use tempfile::TempDir;
 
     use super::*;
     use crate::config::{BodyPresentation, Placement, StackOrder};
+
+    fn environment(root: &Path) -> Environment {
+        Environment::from_pairs([(OsString::from("HOME"), root.as_os_str().to_owned())])
+    }
+
+    fn write_private(path: &Path, contents: &str) {
+        let mut options = OpenOptions::new();
+        options.create(true).truncate(true).write(true);
+        #[cfg(unix)]
+        options.mode(0o600);
+        let mut file = options.open(path).unwrap();
+        file.write_all(contents.as_bytes()).unwrap();
+    }
 
     #[test]
     fn application_seam_translates_product_configuration_into_owned_policy() {
@@ -393,6 +506,8 @@ mod tests {
         assert_eq!(settings.display_policy.body, BodyPresentation::Wrap);
         assert!(settings.display_policy.unicode);
         assert!(settings.display_policy.color);
+        assert!(settings.display_policy.animation.enabled);
+        assert_eq!(settings.display_policy.animation.fps, 20);
     }
 
     #[test]
@@ -414,6 +529,66 @@ mod tests {
         assert_eq!(
             shutdown_reason(RuntimeShutdown::ServerEnded),
             ShutdownReason::ServerEnded
+        );
+        assert!(!settings.display_policy.animation.enabled);
+    }
+
+    #[tokio::test]
+    async fn application_reload_applies_valid_settings_and_preserves_invalid_snapshot() {
+        let temporary = TempDir::new().unwrap();
+        #[cfg(unix)]
+        std::fs::set_permissions(temporary.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let config_path = temporary.path().join("config.toml");
+        let log_path = temporary.path().join("tmnotify.log");
+        write_private(&config_path, "");
+        let environment = environment(temporary.path());
+        let manager = Arc::new(Mutex::new(
+            ConfigManager::new(
+                config_path.clone(),
+                environment.clone(),
+                ConfigOverrides::default(),
+            )
+            .unwrap(),
+        ));
+        let logger = Arc::new(PrivateLogger::new(log_path.clone()).unwrap());
+        let initial = DaemonSettings::from_config(&Config::default(), &environment).unwrap();
+        let (sender, mut receiver) = watch::channel(initial);
+        let reload = LiveConfigReload {
+            manager: Arc::clone(&manager),
+            settings_sender: sender,
+            logger,
+            environment,
+            interval: CONFIG_RELOAD_INTERVAL,
+        };
+
+        write_private(
+            &config_path,
+            "[queue]\nmax_pending = 7\n\n[toast]\nwidth = 50\nmax_visible = 2\nposition = \"bottom-left\"\n\n[hooks.codex]\npreset = \"normal\"\n",
+        );
+        reload.reload().await;
+        assert!(receiver.has_changed().unwrap());
+        let settings = *receiver.borrow_and_update();
+        assert_eq!(settings.display_policy.toast_width, 50);
+        assert_eq!(settings.display_policy.placement, Placement::BottomLeft);
+        assert_eq!(settings.scheduler_limits.max_pending, 7);
+        assert_eq!(settings.scheduler_limits.max_visible_toasts, 2);
+        assert_eq!(
+            manager.lock().await.active().hooks.codex.preset,
+            crate::config::HookPreset::Normal
+        );
+        assert!(!temporary.path().join(".codex/hooks.json").exists());
+
+        write_private(
+            &config_path,
+            "[toast]\nwidth = 2\nposition = \"top-center\"\n# invalid snapshot is longer\n",
+        );
+        reload.reload().await;
+        assert!(!receiver.has_changed().unwrap());
+        assert_eq!(manager.lock().await.active().toast.width, 50);
+        assert!(
+            std::fs::read_to_string(log_path)
+                .unwrap()
+                .contains("event=config_invalid")
         );
     }
 }

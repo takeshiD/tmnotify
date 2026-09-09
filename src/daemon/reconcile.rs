@@ -1,17 +1,18 @@
-use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::fmt;
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 
 use super::{DisplayPlan as SchedulerDisplayPlan, LiveScheduler, MonotonicTime, SchedulerError};
-use crate::config::{BodyPresentation, Placement, StackOrder};
+use crate::config::{BodyPresentation, Easing, Placement, StackOrder};
 use crate::notification::NotificationId;
 use crate::protocol::{RendererBodyMode, RendererContent, RendererDisplayOptions};
 use crate::tmux::{
     Backend, DisplayKind, DisplayPlan, Event, Geometry, PlannedDisplay, ReconcileReport, Topology,
     WindowId, WindowSize,
 };
+use crate::toast::{MotionPhase, MotionTrack, Rect, Viewport, offscreen_rect, plan_frames};
 
 const MAX_EVENTS_PER_TICK: usize = 128;
 const MAX_RENDER_ATTEMPTS: u8 = 3;
@@ -30,6 +31,37 @@ pub struct WindowDisplayPolicy {
     pub body: BodyPresentation,
     pub unicode: bool,
     pub color: bool,
+    pub animation: ToastAnimationPolicy,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ToastAnimationPolicy {
+    pub enabled: bool,
+    pub fps: u32,
+    pub enter_duration: Duration,
+    pub exit_duration: Duration,
+    pub enter_easing: Easing,
+    pub exit_easing: Easing,
+}
+
+impl ToastAnimationPolicy {
+    #[must_use]
+    pub fn frame_interval(self) -> Duration {
+        Duration::from_secs_f64(1.0 / f64::from(self.fps.clamp(1, 120)))
+    }
+}
+
+impl Default for ToastAnimationPolicy {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            fps: 20,
+            enter_duration: Duration::from_millis(180),
+            exit_duration: Duration::from_millis(150),
+            enter_easing: Easing::EaseOut,
+            exit_easing: Easing::EaseIn,
+        }
+    }
 }
 
 impl Default for WindowDisplayPolicy {
@@ -44,6 +76,156 @@ impl Default for WindowDisplayPolicy {
             body: BodyPresentation::FirstLine,
             unicode: true,
             color: true,
+            animation: ToastAnimationPolicy::default(),
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct DisplayMetadata {
+    notification_id: NotificationId,
+    placement: Placement,
+    viewport: Viewport,
+}
+
+#[derive(Clone, Debug)]
+struct Motion {
+    started_at: MonotonicTime,
+    phase: MotionPhase,
+    frames: VecDeque<(Duration, Rect)>,
+    current: Rect,
+    finished_on_previous_tick: bool,
+}
+
+#[derive(Clone, Debug)]
+struct MotionSpec {
+    display_id: String,
+    from: Rect,
+    to: Rect,
+    phase: MotionPhase,
+    duration: Duration,
+    easing: Easing,
+}
+
+#[derive(Default)]
+struct AnimationRuntime {
+    motions: HashMap<String, Motion>,
+    exiting: HashMap<String, (WindowId, PlannedDisplay)>,
+    paused_at: Option<MonotonicTime>,
+}
+
+impl AnimationRuntime {
+    fn clear(&mut self) {
+        self.motions.clear();
+        self.exiting.clear();
+    }
+
+    fn pause(&mut self, now: MonotonicTime) {
+        self.paused_at.get_or_insert(now);
+    }
+
+    fn resume(&mut self, now: MonotonicTime) {
+        let Some(paused_at) = self.paused_at.take() else {
+            return;
+        };
+        let paused = now.as_duration().saturating_sub(paused_at.as_duration());
+        for motion in self.motions.values_mut() {
+            motion.started_at = MonotonicTime::from_duration(
+                motion.started_at.as_duration().saturating_add(paused),
+            );
+        }
+    }
+
+    fn start(&mut self, specs: Vec<MotionSpec>, fps: u32, now: MonotonicTime) {
+        if specs.is_empty() {
+            return;
+        }
+        let tracks = specs
+            .iter()
+            .map(|spec| MotionTrack {
+                window_id: spec.display_id.as_str(),
+                from: spec.from,
+                to: spec.to,
+                phase: spec.phase,
+                duration: spec.duration,
+                easing: spec.easing,
+            })
+            .collect::<Vec<_>>();
+        let batches = plan_frames(&tracks, fps, true);
+        let mut planned = HashMap::<String, VecDeque<(Duration, Rect)>>::new();
+        for batch in &batches {
+            for update in &batch.updates {
+                planned
+                    .entry(update.window_id.to_owned())
+                    .or_default()
+                    .push_back((batch.at, update.rect));
+            }
+        }
+        drop(batches);
+        drop(tracks);
+        for spec in specs {
+            let frames = planned.remove(&spec.display_id).unwrap_or_default();
+            self.motions.insert(
+                spec.display_id,
+                Motion {
+                    started_at: now,
+                    phase: spec.phase,
+                    frames,
+                    current: spec.from,
+                    finished_on_previous_tick: false,
+                },
+            );
+        }
+    }
+
+    fn advance(&mut self, now: MonotonicTime) -> bool {
+        let mut changed = false;
+        let mut remove = Vec::new();
+        for (id, motion) in &mut self.motions {
+            if motion.finished_on_previous_tick {
+                remove.push(id.clone());
+                changed = true;
+                continue;
+            }
+            let elapsed = now
+                .as_duration()
+                .saturating_sub(motion.started_at.as_duration());
+            while motion.frames.front().is_some_and(|(at, _)| *at <= elapsed) {
+                let (_, rect) = motion.frames.pop_front().expect("front was present");
+                if motion.current != rect {
+                    motion.current = rect;
+                    changed = true;
+                }
+            }
+            if motion.frames.is_empty() {
+                match motion.phase {
+                    MotionPhase::Enter => remove.push(id.clone()),
+                    MotionPhase::Exit => motion.finished_on_previous_tick = true,
+                    MotionPhase::Stay => remove.push(id.clone()),
+                }
+            }
+        }
+        for id in remove {
+            self.motions.remove(&id);
+            self.exiting.remove(&id);
+        }
+        changed
+    }
+
+    fn apply(&self, plan: &mut DisplayPlan) {
+        for (id, (window, display)) in &self.exiting {
+            plan.windows
+                .entry(window.clone())
+                .or_default()
+                .push(display.clone());
+            debug_assert_eq!(id, &display.display_id);
+        }
+        for displays in plan.windows.values_mut() {
+            for display in displays {
+                if let Some(motion) = self.motions.get(&display.display_id) {
+                    display.geometry = geometry_from_rect(motion.current, display.geometry.z_index);
+                }
+            }
         }
     }
 }
@@ -106,6 +288,9 @@ pub struct WindowReconciler {
     content_revision: u64,
     next_reconnect_at: MonotonicTime,
     reconnect_backoff: Duration,
+    target_plan: DisplayPlan,
+    target_metadata: HashMap<String, DisplayMetadata>,
+    animation: AnimationRuntime,
 }
 
 impl WindowReconciler {
@@ -122,6 +307,9 @@ impl WindowReconciler {
             content_revision: 0,
             next_reconnect_at: now,
             reconnect_backoff: INITIAL_RECONNECT_BACKOFF,
+            target_plan: DisplayPlan::default(),
+            target_metadata: HashMap::new(),
+            animation: AnimationRuntime::default(),
         }
     }
 
@@ -133,6 +321,21 @@ impl WindowReconciler {
     /// Forces the permitted low-frequency topology snapshot on the next tick.
     pub fn request_full_reconciliation(&mut self) {
         self.dirty = true;
+    }
+
+    /// Atomically replaces display policy. Reflow and restyling are immediate;
+    /// an in-flight motion is cancelled rather than replayed under new values.
+    pub fn update_policy(&mut self, policy: WindowDisplayPolicy) {
+        if self.policy != policy {
+            self.policy = policy;
+            self.animation.clear();
+            self.dirty = true;
+        }
+    }
+
+    #[must_use]
+    pub fn frame_interval(&self) -> Duration {
+        self.policy.animation.frame_interval()
     }
 
     pub fn tick<B: Backend>(
@@ -167,6 +370,7 @@ impl WindowReconciler {
                 Ok(topology) => {
                     self.topology = topology;
                     self.connected = true;
+                    self.animation.resume(now);
                     self.dirty = true;
                     self.retries.clear();
                     self.reconnect_backoff = INITIAL_RECONNECT_BACKOFF;
@@ -193,8 +397,11 @@ impl WindowReconciler {
             }
         }
 
+        self.projected_notifications
+            .retain(|id| scheduler.notification(*id).is_some());
         let eligible = self.topology.eligible_windows();
         if eligible.is_empty() {
+            self.animation.clear();
             scheduler.set_display_available(false, now, wall_now)?;
             let retry_due = self
                 .retries
@@ -235,7 +442,19 @@ impl WindowReconciler {
             self.dirty = true;
         }
 
-        let desired = self.build_plan(scheduler, &scheduler_plan, &eligible);
+        let (target, metadata) = self.build_plan(scheduler, &scheduler_plan, &eligible);
+        self.update_animations(scheduler, &target, &metadata, now);
+        if target != self.target_plan {
+            self.dirty = true;
+        }
+        self.target_plan = target.clone();
+        clear_enter_hints(&mut self.target_plan);
+        self.target_metadata = metadata;
+        if self.animation.advance(now) {
+            self.dirty = true;
+        }
+        let mut desired = target;
+        self.animation.apply(&mut desired);
         let retry_due = self
             .retries
             .values()
@@ -301,12 +520,13 @@ impl WindowReconciler {
         scheduler: &LiveScheduler,
         scheduler_plan: &SchedulerDisplayPlan,
         eligible: &BTreeSet<WindowId>,
-    ) -> DisplayPlan {
+    ) -> (DisplayPlan, HashMap<String, DisplayMetadata>) {
         let initial_ids = desired_notification_ids(scheduler_plan)
             .into_iter()
             .filter(|id| !self.projected_notifications.contains(id))
             .collect::<HashSet<_>>();
         let mut plan = DisplayPlan::default();
+        let mut metadata = HashMap::new();
         for window in eligible {
             let size = self.topology.window_size(window).unwrap_or(WindowSize {
                 width: 80,
@@ -327,13 +547,14 @@ impl WindowReconciler {
                     &scheduler_plan.toasts,
                     size,
                     &initial_ids,
+                    &mut metadata,
                 )
             };
             plan.windows.insert(window.clone(), displays);
         }
         self.projected_notifications
             .extend(desired_notification_ids(scheduler_plan));
-        plan
+        (plan, metadata)
     }
 
     fn planned_attention(
@@ -372,6 +593,7 @@ impl WindowReconciler {
         ids: &[NotificationId],
         size: WindowSize,
         initial_ids: &HashSet<NotificationId>,
+        metadata: &mut HashMap<String, DisplayMetadata>,
     ) -> Vec<PlannedDisplay> {
         if size.width < 24 || size.height == 0 {
             return Vec::new();
@@ -401,8 +623,20 @@ impl WindowReconciler {
                 let geometry =
                     toast_geometry(size, width, height, stride, *slot, placement, z_index);
                 *slot = slot.saturating_add(1);
+                let display_id = display_id(id, window);
+                metadata.insert(
+                    display_id.clone(),
+                    DisplayMetadata {
+                        notification_id: id,
+                        placement,
+                        viewport: Viewport {
+                            width: size.width,
+                            height: size.height,
+                        },
+                    },
+                );
                 PlannedDisplay {
-                    display_id: display_id(id, window),
+                    display_id,
                     kind: DisplayKind::Toast,
                     geometry,
                     content: renderer_content(scheduler, id, self.policy),
@@ -410,6 +644,88 @@ impl WindowReconciler {
                 }
             })
             .collect()
+    }
+
+    fn update_animations(
+        &mut self,
+        scheduler: &LiveScheduler,
+        target: &DisplayPlan,
+        metadata: &HashMap<String, DisplayMetadata>,
+        now: MonotonicTime,
+    ) {
+        let policy = self.policy.animation;
+        if !policy.enabled {
+            self.animation.clear();
+            return;
+        }
+        let target_displays = displays_by_id(target);
+        let previous_displays = displays_by_id(&self.target_plan);
+        for (id, (_, previous)) in &previous_displays {
+            let still_live_but_removed = !target_displays.contains_key(id)
+                && self
+                    .target_metadata
+                    .get(id)
+                    .is_some_and(|meta| scheduler.notification(meta.notification_id).is_some());
+            let reflowed = target_displays
+                .get(id)
+                .is_some_and(|(_, current)| current.geometry != previous.geometry);
+            if still_live_but_removed || reflowed {
+                self.animation.motions.remove(id);
+                self.animation.exiting.remove(id);
+            }
+        }
+        let mut specs = Vec::new();
+        if !policy.enter_duration.is_zero() {
+            for (id, (_, display)) in &target_displays {
+                if !previous_displays.contains_key(id)
+                    && display.kind == DisplayKind::Toast
+                    && display.play_enter_animation
+                    && let Some(meta) = metadata.get(id)
+                {
+                    let target_rect = rect_from_geometry(display.geometry);
+                    specs.push(MotionSpec {
+                        display_id: id.clone(),
+                        from: offscreen_rect(target_rect, meta.viewport, meta.placement),
+                        to: target_rect,
+                        phase: MotionPhase::Enter,
+                        duration: policy.enter_duration,
+                        easing: policy.enter_easing,
+                    });
+                }
+            }
+        }
+        if !policy.exit_duration.is_zero() {
+            for (id, (window, display)) in previous_displays {
+                let Some(meta) = self.target_metadata.get(&id) else {
+                    continue;
+                };
+                if target_displays.contains_key(&id)
+                    || display.kind != DisplayKind::Toast
+                    || scheduler.notification(meta.notification_id).is_some()
+                {
+                    continue;
+                }
+                let from = self.animation.motions.get(&id).map_or_else(
+                    || rect_from_geometry(display.geometry),
+                    |motion| motion.current,
+                );
+                let mut exit_display = display.clone();
+                exit_display.geometry = geometry_from_rect(from, display.geometry.z_index);
+                exit_display.play_enter_animation = false;
+                self.animation
+                    .exiting
+                    .insert(id.clone(), (window, exit_display));
+                specs.push(MotionSpec {
+                    display_id: id,
+                    from,
+                    to: offscreen_rect(from, meta.viewport, meta.placement),
+                    phase: MotionPhase::Exit,
+                    duration: policy.exit_duration,
+                    easing: policy.exit_easing,
+                });
+            }
+        }
+        self.animation.start(specs, policy.fps, now);
     }
 
     fn apply_report(
@@ -459,6 +775,7 @@ impl WindowReconciler {
 
     fn disconnect(&mut self, now: MonotonicTime) {
         self.connected = false;
+        self.animation.pause(now);
         self.successful_windows.clear();
         self.next_reconnect_at = add_time(now, self.reconnect_backoff);
         self.reconnect_backoff = self
@@ -469,6 +786,7 @@ impl WindowReconciler {
 
     fn schedule_reconnect(&mut self, now: MonotonicTime) {
         self.connected = false;
+        self.animation.pause(now);
         self.next_reconnect_at = add_time(now, self.reconnect_backoff);
         self.reconnect_backoff = self
             .reconnect_backoff
@@ -550,6 +868,47 @@ fn toast_geometry(
         width,
         height,
         z_index: u16::try_from(z_index).unwrap_or(u16::MAX),
+    }
+}
+
+fn displays_by_id(plan: &DisplayPlan) -> HashMap<String, (WindowId, PlannedDisplay)> {
+    plan.windows
+        .iter()
+        .flat_map(|(window, displays)| {
+            displays.iter().map(|display| {
+                (
+                    display.display_id.clone(),
+                    (window.clone(), display.clone()),
+                )
+            })
+        })
+        .collect()
+}
+
+fn clear_enter_hints(plan: &mut DisplayPlan) {
+    for displays in plan.windows.values_mut() {
+        for display in displays {
+            display.play_enter_animation = false;
+        }
+    }
+}
+
+fn rect_from_geometry(geometry: Geometry) -> Rect {
+    Rect {
+        x: geometry.x,
+        y: geometry.y,
+        width: geometry.width,
+        height: geometry.height,
+    }
+}
+
+fn geometry_from_rect(rect: Rect, z_index: u16) -> Geometry {
+    Geometry {
+        x: rect.x,
+        y: rect.y,
+        width: rect.width,
+        height: rect.height,
+        z_index,
     }
 }
 
@@ -669,6 +1028,13 @@ mod tests {
             .with_timeout(Timeout::Never)
     }
 
+    fn finite_toast(title: &str, timeout: Duration) -> NotificationDraft {
+        NotificationDraft::new(Presentation::Toast, title, "body", Some(source()))
+            .unwrap()
+            .with_priority(Priority::Normal)
+            .with_timeout(Timeout::After(timeout))
+    }
+
     fn topology(clients: &[(&str, bool, &str)], windows: &[(&str, u16, u16)]) -> Topology {
         let clients = clients
             .iter()
@@ -760,6 +1126,10 @@ mod tests {
             WindowDisplayPolicy {
                 placement: Placement::BottomCenter,
                 stack_order: StackOrder::NewestFirst,
+                animation: ToastAnimationPolicy {
+                    enabled: false,
+                    ..ToastAnimationPolicy::default()
+                },
                 ..WindowDisplayPolicy::default()
             },
             mono(0),
@@ -803,17 +1173,179 @@ mod tests {
             scheduler.notification(sent.id).unwrap().timeout(),
             Timeout::Never
         );
+        reconciler
+            .tick(&mut backend, &mut scheduler, mono(50), wall(50))
+            .unwrap();
+        assert_eq!(
+            backend.plans.len(),
+            2,
+            "abandoned enter frames stay cancelled"
+        );
 
         backend.topology = topology(&[], &[("@2", 80, 24)]);
         backend.events.push_back(Event::TopologyChanged);
         reconciler
-            .tick(&mut backend, &mut scheduler, mono(2), wall(2))
+            .tick(&mut backend, &mut scheduler, mono(51), wall(51))
             .unwrap();
-        assert!(backend.plans.last().unwrap().windows.is_empty());
+        assert!(
+            backend
+                .plans
+                .last()
+                .unwrap()
+                .windows
+                .values()
+                .all(Vec::is_empty)
+        );
         assert_eq!(
             scheduler.notification(sent.id).unwrap().delivery(),
             crate::notification::DeliveryState::Visible
         );
+    }
+
+    #[test]
+    fn production_plan_runs_batched_enter_stay_exit_frames_and_timeout() {
+        let mut backend = FakeBackend {
+            topology: topology(
+                &[("a", false, "@1"), ("b", false, "@2")],
+                &[("@1", 100, 24), ("@2", 80, 24)],
+            ),
+            ..FakeBackend::default()
+        };
+        let mut scheduler = scheduler();
+        let sent = scheduler
+            .submit(
+                finite_toast("animated", Duration::from_millis(200)),
+                mono(0),
+                wall(0),
+            )
+            .unwrap();
+        let mut reconciler = WindowReconciler::new(
+            WindowDisplayPolicy {
+                animation: ToastAnimationPolicy {
+                    fps: 20,
+                    enter_duration: Duration::from_millis(100),
+                    exit_duration: Duration::from_millis(100),
+                    ..ToastAnimationPolicy::default()
+                },
+                ..WindowDisplayPolicy::default()
+            },
+            mono(0),
+        );
+
+        reconciler
+            .tick(&mut backend, &mut scheduler, mono(0), wall(0))
+            .unwrap();
+        let entered = backend.plans.last().unwrap();
+        assert_eq!(
+            entered.windows.len(),
+            2,
+            "all windows share one frame batch"
+        );
+        assert_eq!(entered.windows[&WindowId("@1".into())][0].geometry.x, 16);
+        assert_eq!(entered.windows[&WindowId("@2".into())][0].geometry.x, 0);
+
+        reconciler
+            .tick(&mut backend, &mut scheduler, mono(10), wall(10))
+            .unwrap();
+        assert_eq!(backend.plans.len(), 1, "quantized stay emits no duplicate");
+        reconciler
+            .tick(&mut backend, &mut scheduler, mono(50), wall(50))
+            .unwrap();
+        assert_eq!(backend.plans.len(), 2);
+        let midway = backend.plans.last().unwrap();
+        assert_eq!(midway.windows[&WindowId("@1".into())][0].geometry.x, 48);
+        assert_eq!(midway.windows[&WindowId("@2".into())][0].geometry.x, 29);
+
+        reconciler
+            .tick(&mut backend, &mut scheduler, mono(100), wall(100))
+            .unwrap();
+        assert_eq!(
+            backend.plans.last().unwrap().windows[&WindowId("@1".into())][0]
+                .geometry
+                .x,
+            58
+        );
+        assert!(scheduler.notification(sent.id).is_some());
+
+        reconciler
+            .tick(&mut backend, &mut scheduler, mono(199), wall(199))
+            .unwrap();
+        assert!(scheduler.notification(sent.id).is_some());
+        let stay_plan_count = backend.plans.len();
+        reconciler
+            .tick(&mut backend, &mut scheduler, mono(200), wall(200))
+            .unwrap();
+        assert!(scheduler.notification(sent.id).is_none());
+        assert_eq!(backend.plans.len(), stay_plan_count + 1);
+        assert!(!backend.plans.last().unwrap().windows.is_empty());
+
+        reconciler
+            .tick(&mut backend, &mut scheduler, mono(300), wall(300))
+            .unwrap();
+        assert_eq!(
+            backend.plans.last().unwrap().windows[&WindowId("@1".into())][0]
+                .geometry
+                .x,
+            16
+        );
+        reconciler
+            .tick(&mut backend, &mut scheduler, mono(301), wall(301))
+            .unwrap();
+        assert!(
+            backend
+                .plans
+                .last()
+                .unwrap()
+                .windows
+                .values()
+                .all(Vec::is_empty)
+        );
+    }
+
+    #[test]
+    fn display_policy_reload_reconciles_without_replaying_enter() {
+        let mut backend = FakeBackend {
+            topology: topology(&[("a", false, "@1")], &[("@1", 100, 24)]),
+            ..FakeBackend::default()
+        };
+        let mut scheduler = scheduler();
+        scheduler
+            .submit(toast("configured"), mono(0), wall(0))
+            .unwrap();
+        let disabled = ToastAnimationPolicy {
+            enabled: false,
+            ..ToastAnimationPolicy::default()
+        };
+        let mut reconciler = WindowReconciler::new(
+            WindowDisplayPolicy {
+                animation: disabled,
+                ..WindowDisplayPolicy::default()
+            },
+            mono(0),
+        );
+        reconciler
+            .tick(&mut backend, &mut scheduler, mono(0), wall(0))
+            .unwrap();
+        reconciler.update_policy(WindowDisplayPolicy {
+            placement: Placement::BottomLeft,
+            toast_width: 50,
+            animation: disabled,
+            ..WindowDisplayPolicy::default()
+        });
+        reconciler
+            .tick(&mut backend, &mut scheduler, mono(1), wall(1))
+            .unwrap();
+
+        let display = &backend.plans.last().unwrap().windows[&WindowId("@1".into())][0];
+        assert_eq!(
+            (
+                display.geometry.x,
+                display.geometry.y,
+                display.geometry.width
+            ),
+            (0, 21, 50)
+        );
+        assert!(!display.play_enter_animation);
     }
 
     #[test]
@@ -972,5 +1504,12 @@ mod tests {
             .tick(&mut backend, &mut scheduler, mono(301), wall(301))
             .unwrap();
         assert_eq!(backend.plans.len(), 2);
+        assert_eq!(
+            backend.plans.last().unwrap().windows[&WindowId("@1".into())][0]
+                .geometry
+                .x,
+            0,
+            "control loss pauses rather than completes enter animation"
+        );
     }
 }

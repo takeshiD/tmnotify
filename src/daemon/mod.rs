@@ -11,7 +11,8 @@ pub mod runtime;
 mod service;
 
 pub use reconcile::{
-    ReconcileError, ReconcileOutcome, ReconcileStatus, WindowDisplayPolicy, WindowReconciler,
+    ReconcileError, ReconcileOutcome, ReconcileStatus, ToastAnimationPolicy, WindowDisplayPolicy,
+    WindowReconciler,
 };
 pub use service::{DaemonService, JumpExecutor, ServiceError, ServiceResponse};
 
@@ -467,6 +468,45 @@ impl LiveScheduler {
         self.rebalance(monotonic_now, wall_now)
     }
 
+    /// Applies bounded live queue/capacity settings without rebuilding live
+    /// Notification state. Toasts beyond a reduced visible capacity return to
+    /// the pending queue with their timeout paused.
+    pub fn update_limits(
+        &mut self,
+        limits: SchedulerLimits,
+        monotonic_now: MonotonicTime,
+        wall_now: DateTime<Utc>,
+    ) -> Result<(), SchedulerError> {
+        self.prepare_time(monotonic_now, wall_now)?;
+        if self.limits == limits {
+            return Ok(());
+        }
+        self.limits = limits;
+        self.closed_capacity = limits
+            .max_pending
+            .saturating_add(limits.max_visible_toasts)
+            .saturating_add(1);
+        if self.active_toasts.len() > limits.max_visible_toasts {
+            let deferred = self.active_toasts.split_off(limits.max_visible_toasts);
+            for id in &deferred {
+                self.entries
+                    .get_mut(id)
+                    .expect("active Toast must exist")
+                    .timeout
+                    .set_running(monotonic_now, false)?;
+            }
+            self.pending.extend(deferred);
+        }
+        self.sort_pending();
+        self.rebalance(monotonic_now, wall_now)?;
+        self.enforce_pending_limit(wall_now);
+        while self.closed.len() > self.closed_capacity {
+            self.closed.pop_front();
+        }
+        self.bump_content_revision();
+        Ok(())
+    }
+
     pub fn advance(
         &mut self,
         monotonic_now: MonotonicTime,
@@ -847,6 +887,31 @@ mod tests {
             SchedulerLimits::new(max_pending, max_visible_toasts).unwrap(),
             mono(0),
         )
+    }
+
+    #[test]
+    fn live_limits_defer_excess_toasts_and_pause_their_timeout() {
+        let mut scheduler = scheduler(10, 2);
+        scheduler
+            .set_display_available(true, mono(0), wall(0))
+            .unwrap();
+        let first = scheduler
+            .submit(toast("first", Priority::Normal), mono(0), wall(0))
+            .unwrap();
+        let second = scheduler
+            .submit(toast("second", Priority::Normal), mono(0), wall(0))
+            .unwrap();
+        scheduler
+            .update_limits(SchedulerLimits::new(10, 1).unwrap(), mono(1), wall(1))
+            .unwrap();
+        assert_eq!(scheduler.display_plan().toasts, vec![first.id]);
+
+        scheduler.advance(mono(2), wall(2)).unwrap();
+        assert!(scheduler.notification(second.id).is_some());
+        scheduler.dismiss(first.id, mono(2), wall(2)).unwrap();
+        assert_eq!(scheduler.display_plan().toasts, vec![second.id]);
+        scheduler.advance(mono(3), wall(3)).unwrap();
+        assert!(scheduler.notification(second.id).is_some());
     }
 
     #[test]
