@@ -2,15 +2,12 @@
 
 use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
-use std::pin::Pin;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use chrono::Utc;
 use serde_json::Value;
 use thiserror::Error;
-use tokio::sync::{Mutex, oneshot};
 
 use crate::cli::{
     ClearArgs, Cli, Command, DoctorArgs, HistoryAction, HistoryArgs, HookAction, HookArgs,
@@ -18,14 +15,7 @@ use crate::cli::{
     Selector, TmuxTarget,
 };
 use crate::config::{Config, ConfigOverrides, FeatureMode, HooksConfig, TimeoutValue, load};
-use crate::daemon::runtime::{
-    OwnedSocket, RuntimeError, RuntimeLimits, RuntimeShutdown, ServerIdentity,
-    SessionRendererBroker, serve_with_renderers_and_force_shutdown, submit_lazy,
-};
-use crate::daemon::{
-    DaemonService, JumpExecutor, LiveScheduler, MonotonicTime, SchedulerLimits, ShutdownReason,
-    WindowDisplayPolicy, WindowReconciler,
-};
+use crate::daemon::runtime::{RuntimeError, ServerIdentity, submit_lazy};
 use crate::doctor::{DoctorOutputError, HookObservation, SystemProbe};
 use crate::history::{ClearFilter, History, HistoryError, HistoryQuery, write_ndjson, write_plain};
 use crate::hooks::{HookError, HookManager, HookSubmitter, Scope, receive_hook_event};
@@ -37,10 +27,7 @@ use crate::protocol::{
 };
 use crate::providers::HookPolicy;
 use crate::renderer_runtime::{RendererKind, RendererRuntimeError, run_hidden_renderer};
-use crate::tmux::{
-    Backend as _, DisplayPlan as TmuxDisplayPlan, JumpTarget, PaneId, ProductionBackend, Server,
-    WindowId,
-};
+use crate::tmux::{Backend as _, JumpTarget, PaneId, ProductionBackend, Server};
 use crate::ui::history::{
     HistoryActions, HistoryLaunch, HistoryOutcome, OutsideTmuxScope,
     run_with_options as run_history_terminal,
@@ -286,7 +273,11 @@ pub async fn run(cli: Cli) -> Result<(), RuntimeAppError> {
         Command::Doctor(arguments) => {
             run_production_doctor(arguments, selected.as_ref(), &paths, &environment, &config)
         }
-        Command::Daemon => run_daemon(require_server(selected)?, paths, config).await,
+        Command::Daemon => {
+            let selected = require_server(selected)?;
+            crate::daemon::application::run(selected.server, paths, config).await?;
+            Ok(())
+        }
         Command::HistoryUi(arguments) => run_interactive_history(
             HistoryArgs {
                 action: None,
@@ -673,276 +664,6 @@ fn run_production_doctor(
     }
 }
 
-#[derive(Clone)]
-struct ProductionJump {
-    backend: Arc<Mutex<ProductionBackend>>,
-}
-
-impl JumpExecutor for ProductionJump {
-    fn jump(
-        &self,
-        source: SourceContext,
-    ) -> Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send + '_>> {
-        Box::pin(async move {
-            self.backend
-                .lock()
-                .await
-                .jump(&JumpTarget {
-                    pane_id: PaneId(source.pane_id().to_owned()),
-                    likely_client: None,
-                })
-                .map_err(|error| error.to_string())
-        })
-    }
-
-    fn jump_from_attention(
-        &self,
-        source: SourceContext,
-        attention_window: String,
-    ) -> Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send + '_>> {
-        Box::pin(async move {
-            let mut backend = self.backend.lock().await;
-            let topology = backend.topology().map_err(|error| error.to_string())?;
-            let likely_client = topology
-                .likely_client_for_window(&WindowId(attention_window))
-                .map(str::to_owned);
-            backend
-                .jump(&JumpTarget {
-                    pane_id: PaneId(source.pane_id().to_owned()),
-                    likely_client,
-                })
-                .map_err(|error| error.to_string())
-        })
-    }
-}
-
-async fn run_daemon(
-    selected: SelectedServer,
-    paths: PlatformPaths,
-    config: Config,
-) -> Result<(), RuntimeAppError> {
-    paths.ensure_private_directories()?;
-    let environment = Environment::current();
-    let term_is_dumb = environment.get("TERM").is_some_and(|value| value == "dumb");
-    let unicode = config.display.unicode != FeatureMode::Never && !term_is_dumb;
-    let color = config.display.color != FeatureMode::Never
-        && !term_is_dumb
-        && environment.get("NO_COLOR").is_none();
-    let executable = std::env::current_exe()?;
-    let mut production = ProductionBackend::connect(selected.server.clone(), executable)?;
-    production.capabilities()?;
-    let owned = OwnedSocket::bind(&selected.daemon_socket)?;
-    let history = Arc::new(History::open(
-        &paths.history_file,
-        selected.domain_id,
-        &config.history,
-        Utc::now(),
-    )?);
-    let origin = Instant::now();
-    let scheduler = LiveScheduler::new(
-        SchedulerLimits::new(
-            usize::try_from(config.queue.max_pending).unwrap_or(10_000),
-            usize::try_from(config.toast.max_visible).unwrap_or(100),
-        )?,
-        MonotonicTime::default(),
-    );
-    let renderer_sessions = production.renderer_sessions();
-    let backend = Arc::new(Mutex::new(production));
-    let service = DaemonService::new(
-        scheduler,
-        Arc::clone(&history),
-        ProductionJump {
-            backend: Arc::clone(&backend),
-        },
-    );
-    let scheduler = service.scheduler();
-    let action_service = service.clone();
-    let renderer_broker = Arc::new(SessionRendererBroker::new(
-        renderer_sessions,
-        move |display_id: String, action: crate::protocol::RendererAction| {
-            let service = action_service.clone();
-            async move {
-                service
-                    .handle_renderer_action(&display_id, action, monotonic(origin), Utc::now())
-                    .await
-                    .map_err(|error| error.to_string())
-            }
-        },
-    ));
-    let stopping = Arc::new(AtomicBool::new(false));
-    let reconcile_task = tokio::spawn(reconcile_loop(
-        Arc::clone(&backend),
-        Arc::clone(&scheduler),
-        Arc::clone(&history),
-        Arc::clone(&stopping),
-        origin,
-        WindowDisplayPolicy {
-            placement: config.toast.position,
-            toast_width: u16::try_from(config.toast.width).unwrap_or(u16::MAX),
-            toast_height: u16::try_from(config.toast.height).unwrap_or(u16::MAX),
-            toast_gap: u16::try_from(config.toast.gap).unwrap_or(u16::MAX),
-            max_visible_toasts: usize::try_from(config.toast.max_visible).unwrap_or(100),
-            stack_order: config.toast.stack_order,
-            body: config.toast.body,
-            unicode,
-            color,
-        },
-    ));
-    let handler_service = service.clone();
-    let handler = move |envelope| {
-        let service = handler_service.clone();
-        async move {
-            service
-                .handle_envelope(&envelope, monotonic(origin), Utc::now())
-                .await
-                .and_then(|response| serde_json::to_value(response).map_err(Into::into))
-                .map_err(|error| error.to_string())
-        }
-    };
-    let shutdown_path = selected.identity.tmux_socket().to_owned();
-    let cleanup_scheduler = Arc::clone(&scheduler);
-    let cleanup_backend = Arc::clone(&backend);
-    let cleanup_history = Arc::clone(&history);
-    let cleanup_stopping = Arc::clone(&stopping);
-    let (shutdown, force_shutdown) = shutdown_signals(shutdown_path);
-    let result = serve_with_renderers_and_force_shutdown(
-        owned,
-        RuntimeLimits::default(),
-        handler,
-        renderer_broker,
-        shutdown,
-        force_shutdown,
-        move |reason| async move {
-            cleanup_stopping.store(true, Ordering::Release);
-            let reason = match reason {
-                RuntimeShutdown::Signal => ShutdownReason::Stopped,
-                RuntimeShutdown::ServerEnded => ShutdownReason::ServerEnded,
-            };
-            let snapshots = {
-                let mut scheduler = cleanup_scheduler.lock().await;
-                let _ = scheduler.shutdown(reason, monotonic(origin), Utc::now());
-                scheduler.drain_closed()
-            };
-            persist_all(&cleanup_history, snapshots).await;
-            let _ = cleanup_backend
-                .lock()
-                .await
-                .reconcile(&TmuxDisplayPlan::default());
-            if let Ok(task) = cleanup_history.flush() {
-                let _ = task.wait().await;
-            }
-        },
-    )
-    .await;
-    stopping.store(true, Ordering::Release);
-    reconcile_task.abort();
-    result?;
-    Ok(())
-}
-
-async fn reconcile_loop(
-    backend: Arc<Mutex<ProductionBackend>>,
-    scheduler: Arc<Mutex<LiveScheduler>>,
-    history: Arc<History>,
-    stopping: Arc<AtomicBool>,
-    origin: Instant,
-    policy: WindowDisplayPolicy,
-) {
-    let mut reconciler = WindowReconciler::new(policy, MonotonicTime::default());
-    while !stopping.load(Ordering::Acquire) {
-        let snapshots = {
-            let mut backend = backend.lock().await;
-            let mut scheduler = scheduler.lock().await;
-            let _ = reconciler.tick(&mut *backend, &mut scheduler, monotonic(origin), Utc::now());
-            scheduler.drain_closed()
-        };
-        enqueue_all(&history, snapshots);
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
-}
-
-fn enqueue_all(history: &History, snapshots: Vec<crate::notification::Notification>) {
-    for notification in snapshots {
-        // The worker owns SQLite retries. Dropping the receipt here keeps the
-        // display loop independent from database latency while retaining the
-        // bounded History channel as backpressure.
-        let _ = history.persist(&notification);
-    }
-}
-
-async fn persist_all(history: &History, snapshots: Vec<crate::notification::Notification>) {
-    for notification in snapshots {
-        if let Ok(task) = history.persist(&notification) {
-            let _ = task.wait().await;
-        }
-    }
-}
-
-fn monotonic(origin: Instant) -> MonotonicTime {
-    MonotonicTime::from_duration(origin.elapsed())
-}
-
-fn shutdown_signals(
-    tmux_socket: PathBuf,
-) -> (
-    impl std::future::Future<Output = RuntimeShutdown>,
-    impl std::future::Future<Output = ()>,
-) {
-    let (graceful_tx, graceful_rx) = oneshot::channel();
-    let (forced_tx, forced_rx) = oneshot::channel();
-    tokio::spawn(async move {
-        let mut graceful_tx = Some(graceful_tx);
-        let mut forced_tx = Some(forced_tx);
-        let mut interrupt_count = 0_u8;
-        let mut terminate =
-            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-                .expect("SIGTERM handler installation failed");
-        loop {
-            tokio::select! {
-                interrupt = tokio::signal::ctrl_c() => {
-                    if interrupt.is_err() {
-                        break;
-                    }
-                    interrupt_count = interrupt_count.saturating_add(1);
-                    if interrupt_count == 1 {
-                        if let Some(sender) = graceful_tx.take() {
-                            let _ = sender.send(RuntimeShutdown::Signal);
-                        }
-                    } else {
-                        if let Some(sender) = forced_tx.take() {
-                            let _ = sender.send(());
-                        }
-                        break;
-                    }
-                }
-                signal = terminate.recv() => {
-                    if signal.is_none() {
-                        break;
-                    }
-                    if let Some(sender) = graceful_tx.take() {
-                        let _ = sender.send(RuntimeShutdown::Signal);
-                    }
-                }
-                _ = tokio::time::sleep(Duration::from_millis(500)), if graceful_tx.is_some() => {
-                    if std::fs::symlink_metadata(&tmux_socket).is_err()
-                        && let Some(sender) = graceful_tx.take()
-                    {
-                        let _ = sender.send(RuntimeShutdown::ServerEnded);
-                    }
-                }
-            }
-        }
-    });
-    (
-        async move { graceful_rx.await.unwrap_or(RuntimeShutdown::Signal) },
-        async move {
-            if forced_rx.await.is_err() {
-                std::future::pending::<()>().await;
-            }
-        },
-    )
-}
-
 struct RuntimeHookSubmitter {
     selected: SelectedServer,
     handle: tokio::runtime::Handle,
@@ -1064,6 +785,8 @@ pub enum RuntimeAppError {
     Protocol(#[from] ProtocolError),
     #[error(transparent)]
     Runtime(#[from] RuntimeError),
+    #[error(transparent)]
+    Daemon(#[from] crate::daemon::application::Error),
     #[error(transparent)]
     Scheduler(#[from] crate::daemon::SchedulerError),
     #[error(transparent)]

@@ -5,6 +5,7 @@
 //! [`DisplayPlan`] through the tmux boundary and commit a [`JumpIntent`] only
 //! after that boundary reports a successful pane switch.
 
+pub mod application;
 mod reconcile;
 pub mod runtime;
 mod service;
