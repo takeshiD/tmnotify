@@ -31,8 +31,9 @@ use crate::platform::{PathError, prepare_private_file_path};
 const SCHEMA_VERSION: i64 = 1;
 const DEFAULT_QUEUE_CAPACITY: usize = 128;
 const BUSY_TIMEOUT: Duration = Duration::from_millis(20);
-const BUSY_RETRY_DELAY: Duration = Duration::from_millis(10);
-const BUSY_ATTEMPTS: usize = 5;
+const SQLITE_BUSY_MAX_ATTEMPTS: usize = 8;
+const SQLITE_BUSY_INITIAL_BACKOFF: Duration = Duration::from_millis(5);
+const SQLITE_BUSY_MAX_BACKOFF: Duration = Duration::from_millis(40);
 
 const MIGRATION_1: &str = r#"
 CREATE TABLE notifications (
@@ -514,7 +515,7 @@ fn clear_entries(
     filter: ClearFilter,
     all_servers: bool,
 ) -> Result<u64, HistoryError> {
-    with_busy_retry(|| {
+    with_sqlite_busy_retry(|| {
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let deleted = match (filter, all_servers) {
             (ClearFilter::Hidden, true) => {
@@ -621,13 +622,15 @@ pub enum HistoryOutputError {
 }
 
 fn open_connection(path: &Path) -> Result<Connection, HistoryError> {
-    let connection = Connection::open_with_flags(
-        path,
-        OpenFlags::SQLITE_OPEN_READ_WRITE
-            | OpenFlags::SQLITE_OPEN_CREATE
-            | OpenFlags::SQLITE_OPEN_NO_MUTEX
-            | OpenFlags::SQLITE_OPEN_NOFOLLOW,
-    )?;
+    let connection = with_sqlite_busy_retry(|| {
+        Connection::open_with_flags(
+            path,
+            OpenFlags::SQLITE_OPEN_READ_WRITE
+                | OpenFlags::SQLITE_OPEN_CREATE
+                | OpenFlags::SQLITE_OPEN_NO_MUTEX
+                | OpenFlags::SQLITE_OPEN_NOFOLLOW,
+        )
+    })?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -638,8 +641,8 @@ fn open_connection(path: &Path) -> Result<Connection, HistoryError> {
             },
         )?;
     }
-    connection.busy_timeout(BUSY_TIMEOUT)?;
-    let journal_mode: String = with_busy_retry(|| {
+    with_sqlite_busy_retry(|| connection.busy_timeout(BUSY_TIMEOUT))?;
+    let journal_mode: String = with_sqlite_busy_retry(|| {
         connection.query_row("PRAGMA journal_mode = WAL", [], |row| row.get(0))
     })?;
     if !journal_mode.eq_ignore_ascii_case("wal") {
@@ -648,12 +651,14 @@ fn open_connection(path: &Path) -> Result<Connection, HistoryError> {
             value: journal_mode,
         });
     }
-    with_busy_retry(|| connection.pragma_update(None, "synchronous", "NORMAL"))?;
+    with_sqlite_busy_retry(|| connection.pragma_update(None, "synchronous", "NORMAL"))?;
     Ok(connection)
 }
 
 fn migrate(connection: &mut Connection) -> Result<(), HistoryError> {
-    let version: i64 = connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+    let version: i64 = with_sqlite_busy_retry(|| {
+        connection.query_row("PRAGMA user_version", [], |row| row.get(0))
+    })?;
     if version > SCHEMA_VERSION {
         return Err(HistoryError::NewerSchema {
             found: version,
@@ -661,7 +666,7 @@ fn migrate(connection: &mut Connection) -> Result<(), HistoryError> {
         });
     }
     if version == 0 {
-        with_busy_retry(|| {
+        with_sqlite_busy_retry(|| {
             let transaction =
                 connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
             // Another daemon may have migrated while this connection waited
@@ -684,7 +689,7 @@ fn recover_stale(
     server: &TmuxServerId,
     now: DateTime<Utc>,
 ) -> Result<(), HistoryError> {
-    with_busy_retry(|| {
+    with_sqlite_busy_retry(|| {
         connection.execute(
             "UPDATE notifications
              SET delivery_state = 'closed', close_reason = 'daemon_interrupted', updated_at = ?1
@@ -707,7 +712,7 @@ fn persist(
     {
         return Err(HistoryError::ServerMismatch);
     }
-    with_busy_retry(|| {
+    with_sqlite_busy_retry(|| {
         let transaction = connection.unchecked_transaction()?;
         persist_in(&transaction, server, notification)?;
         enforce_retention_in(&transaction, max_entries)?;
@@ -782,7 +787,7 @@ fn persist_in(
 }
 
 fn enforce_retention(connection: &Connection, max_entries: u32) -> Result<(), HistoryError> {
-    with_busy_retry(|| enforce_retention_in(connection, max_entries))
+    with_sqlite_busy_retry(|| enforce_retention_in(connection, max_entries))
 }
 
 fn enforce_retention_in(connection: &Connection, max_entries: u32) -> rusqlite::Result<()> {
@@ -802,7 +807,7 @@ fn set_hidden(
     id: NotificationId,
     hidden_at: Option<DateTime<Utc>>,
 ) -> Result<(), HistoryError> {
-    with_busy_retry(|| {
+    with_sqlite_busy_retry(|| {
         connection.execute(
             "UPDATE notifications SET hidden_at = ?1 WHERE id = ?2",
             params![
@@ -819,7 +824,7 @@ fn mark_jumped(
     id: NotificationId,
     jumped_at: DateTime<Utc>,
 ) -> Result<(), HistoryError> {
-    with_busy_retry(|| {
+    with_sqlite_busy_retry(|| {
         connection.execute(
             "UPDATE notifications SET last_jumped_at = ?1 WHERE id = ?2",
             params![jumped_at.timestamp_millis(), id.to_string()],
@@ -833,7 +838,7 @@ fn list_entries(
     current_server: &TmuxServerId,
     query: HistoryQuery,
 ) -> Result<Vec<HistoryEntry>, HistoryError> {
-    with_busy_retry(|| list_entries_in(connection, current_server, query))
+    with_sqlite_busy_retry(|| list_entries_in(connection, current_server, query))
 }
 
 fn list_entries_in(
@@ -999,13 +1004,22 @@ fn sql_conversion(error: impl std::error::Error + Send + Sync + 'static) -> rusq
     rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(error))
 }
 
-fn with_busy_retry<T>(
+fn with_sqlite_busy_retry<T>(
     mut operation: impl FnMut() -> rusqlite::Result<T>,
 ) -> Result<T, HistoryError> {
-    for attempt in 0..BUSY_ATTEMPTS {
+    with_sqlite_busy_retry_and_backoff(&mut operation, thread::sleep)
+}
+
+fn with_sqlite_busy_retry_and_backoff<T>(
+    mut operation: impl FnMut() -> rusqlite::Result<T>,
+    mut backoff: impl FnMut(Duration),
+) -> Result<T, HistoryError> {
+    let mut delay = SQLITE_BUSY_INITIAL_BACKOFF;
+    for attempt in 0..SQLITE_BUSY_MAX_ATTEMPTS {
         match operation() {
-            Err(error) if is_busy(&error) && attempt + 1 < BUSY_ATTEMPTS => {
-                thread::sleep(BUSY_RETRY_DELAY);
+            Err(error) if is_busy(&error) && attempt + 1 < SQLITE_BUSY_MAX_ATTEMPTS => {
+                backoff(delay);
+                delay = delay.saturating_mul(2).min(SQLITE_BUSY_MAX_BACKOFF);
             }
             result => return result.map_err(HistoryError::from),
         }
@@ -1392,23 +1406,59 @@ mod tests {
     #[test]
     fn concurrent_first_open_applies_migration_once() {
         let temporary = TempDir::new().unwrap();
-        let path = history_path(&temporary);
-        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
-        let handles = ["alpha", "beta"].map(|server_id| {
-            let path = path.clone();
-            let barrier = barrier.clone();
-            thread::spawn(move || {
-                barrier.wait();
-                History::open(&path, server(server_id), &config(100), Utc::now())
-            })
-        });
+        const FIRST_OPEN_ROUNDS: usize = 25;
+        const CONCURRENT_OPENERS: usize = 16;
 
-        for handle in handles {
-            let result = handle.join().unwrap();
-            assert!(result.is_ok(), "{result:?}");
+        for round in 0..FIRST_OPEN_ROUNDS {
+            let round_directory = temporary.path().join(format!("round-{round}"));
+            ensure_private_directory(&round_directory).unwrap();
+            let path = round_directory.join("history.sqlite3");
+            let barrier = std::sync::Arc::new(std::sync::Barrier::new(CONCURRENT_OPENERS));
+            let handles = (0..CONCURRENT_OPENERS)
+                .map(|opener| {
+                    let path = path.clone();
+                    let barrier = barrier.clone();
+                    thread::spawn(move || {
+                        barrier.wait();
+                        History::open(
+                            &path,
+                            server(&format!("server-{opener}")),
+                            &config(100),
+                            Utc::now(),
+                        )
+                    })
+                })
+                .collect::<Vec<_>>();
+
+            for handle in handles {
+                let result = handle.join().unwrap();
+                assert!(result.is_ok(), "round {round}: {result:?}");
+            }
+            let connection = Connection::open(path).unwrap();
+            let version: i64 = connection
+                .query_row("PRAGMA user_version", [], |row| row.get(0))
+                .unwrap();
+            assert_eq!(version, SCHEMA_VERSION);
         }
-        let connection = Connection::open(path).unwrap();
-        let version: i64 = connection
+    }
+
+    #[test]
+    fn migration_retries_initial_schema_read_contention() {
+        let temporary = TempDir::new().unwrap();
+        let path = history_path(&temporary);
+        ensure_private_directory(path.parent().unwrap()).unwrap();
+        let mut migrating = Connection::open(&path).unwrap();
+        migrating.busy_timeout(BUSY_TIMEOUT).unwrap();
+        let blocker = Connection::open(&path).unwrap();
+        blocker.execute_batch("BEGIN EXCLUSIVE").unwrap();
+
+        let migration = thread::spawn(move || migrate(&mut migrating));
+        thread::sleep(Duration::from_millis(60));
+        blocker.execute_batch("COMMIT").unwrap();
+
+        migration.join().unwrap().unwrap();
+        let version: i64 = Connection::open(path)
+            .unwrap()
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .unwrap();
         assert_eq!(version, SCHEMA_VERSION);
@@ -1569,15 +1619,23 @@ mod tests {
     #[test]
     fn busy_retries_are_bounded() {
         let attempts = std::cell::Cell::new(0);
-        let result = with_busy_retry::<()>(|| {
-            attempts.set(attempts.get() + 1);
-            Err(rusqlite::Error::SqliteFailure(
-                rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_BUSY),
-                None,
-            ))
-        });
+        let backoffs = std::cell::RefCell::new(Vec::new());
+        let result = with_sqlite_busy_retry_and_backoff::<()>(
+            || {
+                attempts.set(attempts.get() + 1);
+                Err(rusqlite::Error::SqliteFailure(
+                    rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_BUSY),
+                    None,
+                ))
+            },
+            |delay| backoffs.borrow_mut().push(delay),
+        );
         assert!(matches!(result, Err(HistoryError::Sqlite(_))));
-        assert_eq!(attempts.get(), BUSY_ATTEMPTS);
+        assert_eq!(attempts.get(), SQLITE_BUSY_MAX_ATTEMPTS);
+        assert_eq!(
+            backoffs.into_inner(),
+            [5, 10, 20, 40, 40, 40, 40].map(Duration::from_millis)
+        );
     }
 
     #[tokio::test]
