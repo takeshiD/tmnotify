@@ -193,21 +193,24 @@ impl ProductionBackend {
             DisplayKind::Toast => "__render-toast",
             DisplayKind::Attention => "__render-attention",
         };
-        let mut create = vec![
-            "split-window".into(),
-            "-d".into(),
-            "-P".into(),
-            "-F".into(),
-            "#{pane_id}".into(),
-            "-t".into(),
-            window.0.clone(),
-        ];
         let renderer_argv = match self.renderer_argv(renderer_mode, &launch) {
             Ok(arguments) => arguments,
             Err(error) => {
                 self.terminate_renderer(&display_id, RendererTermination::RenderFailed);
                 return Err(error);
             }
+        };
+        let mut create = match desired.kind {
+            DisplayKind::Toast => vec![
+                "split-window".into(),
+                "-d".into(),
+                "-P".into(),
+                "-F".into(),
+                "#{pane_id}".into(),
+                "-t".into(),
+                window.0.clone(),
+            ],
+            DisplayKind::Attention => attention_create_arguments(window, desired.geometry),
         };
         create.extend(renderer_argv);
         let result = match self.command(&[create]) {
@@ -234,22 +237,22 @@ impl ProductionBackend {
             ));
         };
         let pane_id = PaneId(pane);
-        let mut commands = vec![break_floating_command(&pane_id, window, desired.geometry)];
-        if desired.kind == DisplayKind::Attention {
-            commands.push(vec!["select-pane".into(), "-t".into(), pane_id.0.clone()]);
-        }
-        let result = match self.command(&commands) {
-            Ok(result) => result,
-            Err(error) => {
+        if desired.kind == DisplayKind::Toast {
+            let commands = vec![break_floating_command(&pane_id, window, desired.geometry)];
+            let result = match self.command(&commands) {
+                Ok(result) => result,
+                Err(error) => {
+                    let _ =
+                        self.command(&[vec!["kill-pane".into(), "-t".into(), pane_id.0.clone()]]);
+                    self.terminate_renderer(&display_id, RendererTermination::RenderFailed);
+                    return Err(error);
+                }
+            };
+            if let Err(error) = require_success(&result) {
                 let _ = self.command(&[vec!["kill-pane".into(), "-t".into(), pane_id.0.clone()]]);
                 self.terminate_renderer(&display_id, RendererTermination::RenderFailed);
                 return Err(error);
             }
-        };
-        if let Err(error) = require_success(&result) {
-            let _ = self.command(&[vec!["kill-pane".into(), "-t".into(), pane_id.0.clone()]]);
-            self.terminate_renderer(&display_id, RendererTermination::RenderFailed);
-            return Err(error);
         }
         self.displays.insert(
             desired.display_id.clone(),
@@ -402,6 +405,26 @@ impl ProductionBackend {
             let _ = sessions.terminate(id, reason);
         }
     }
+}
+
+fn attention_create_arguments(window: &WindowId, geometry: Geometry) -> Vec<String> {
+    vec![
+        "new-pane".into(),
+        "-O".into(),
+        "-P".into(),
+        "-F".into(),
+        "#{pane_id}".into(),
+        "-t".into(),
+        window.0.clone(),
+        "-X".into(),
+        geometry.x.to_string(),
+        "-Y".into(),
+        geometry.y.to_string(),
+        "-x".into(),
+        geometry.width.to_string(),
+        "-y".into(),
+        geometry.height.to_string(),
+    ]
 }
 
 impl Backend for ProductionBackend {
@@ -979,6 +1002,31 @@ mod tests {
                 "--token",
                 launch.token().expose_secret(),
             ]
+        );
+    }
+
+    #[test]
+    fn attention_creation_uses_the_modal_new_pane_surface() {
+        let command = attention_create_arguments(&WindowId("@7".into()), geometry(3, 4, 32, 9, 0));
+        assert_eq!(
+            command,
+            strings(&[
+                "new-pane",
+                "-O",
+                "-P",
+                "-F",
+                "#{pane_id}",
+                "-t",
+                "@7",
+                "-X",
+                "3",
+                "-Y",
+                "4",
+                "-x",
+                "32",
+                "-y",
+                "9",
+            ])
         );
     }
 

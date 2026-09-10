@@ -7,6 +7,7 @@
 
 use std::future::Future;
 use std::io;
+use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::Arc;
@@ -264,9 +265,15 @@ async fn run_inner(
         },
     ));
     let handler_service = service.clone();
+    // Request tasks are spawned concurrently by the bounded runtime. Keep the
+    // production timestamp and scheduler mutation in the same order: taking a
+    // timestamp before waiting for the scheduler can otherwise let a later
+    // request commit first and make the earlier timestamp appear to go back.
+    let request_order = Arc::new(Mutex::new(()));
     let handler = move |envelope| {
         let service = handler_service.clone();
         let config_reload = config_reload.clone();
+        let request_order = Arc::clone(&request_order);
         async move {
             let request =
                 ClientRequest::from_envelope(&envelope).map_err(|error| error.to_string())?;
@@ -278,6 +285,7 @@ async fn run_inner(
                 }));
             }
             config_reload.reload_if_changed().await;
+            let _request_order = request_order.lock().await;
             service
                 .handle(request.command, monotonic(origin), Utc::now())
                 .await
@@ -573,7 +581,7 @@ fn shutdown_signals(
                     }
                 }
                 _ = tokio::time::sleep(Duration::from_millis(500)), if graceful_tx.is_some() => {
-                    if std::fs::symlink_metadata(&tmux_socket).is_err()
+                    if tmux_server_unreachable(&tmux_socket)
                         && let Some(sender) = graceful_tx.take()
                     {
                         let _ = sender.send(RuntimeShutdown::ServerEnded);
@@ -590,6 +598,10 @@ fn shutdown_signals(
             }
         },
     )
+}
+
+fn tmux_server_unreachable(socket: &Path) -> bool {
+    std::fs::symlink_metadata(socket).is_err() || UnixStream::connect(socket).is_err()
 }
 
 /// Opaque daemon failure. Scheduler, IPC, tmux protocol, renderer, and storage
@@ -625,6 +637,7 @@ mod tests {
     use std::io::Write as _;
     #[cfg(unix)]
     use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+    use std::os::unix::net::UnixListener;
     use std::path::Path;
     use std::sync::Mutex as StdMutex;
 
@@ -644,6 +657,17 @@ mod tests {
         options.mode(0o600);
         let mut file = options.open(path).unwrap();
         file.write_all(contents.as_bytes()).unwrap();
+    }
+
+    #[test]
+    fn server_loss_probe_rejects_a_stale_socket_path() {
+        let temporary = TempDir::new().unwrap();
+        let socket = temporary.path().join("tmux.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        assert!(!tmux_server_unreachable(&socket));
+        drop(listener);
+        assert!(socket.exists(), "Unix listener leaves its pathname behind");
+        assert!(tmux_server_unreachable(&socket));
     }
 
     #[test]

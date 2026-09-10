@@ -19,14 +19,27 @@ control_three_output="$test_directory/control-three.out"
 control_reconnect_output="$test_directory/control-reconnect.out"
 snapshot="$test_directory/topology.txt"
 control_pids=
+probe_status=FAIL
 
 preserve_artifacts() {
     [ -n "${TMNOTIFY_TMUX_ARTIFACT_DIR:-}" ] || return 0
     mkdir -p "$TMNOTIFY_TMUX_ARTIFACT_DIR"
-    for artifact in "$test_directory"/*.out "$snapshot"; do
-        [ -f "$artifact" ] || continue
-        cp "$artifact" "$TMNOTIFY_TMUX_ARTIFACT_DIR/"
-    done
+    report="$TMNOTIFY_TMUX_ARTIFACT_DIR/tmux-capabilities.md"
+    {
+        echo '# Isolated tmux capability probe'
+        echo
+        printf -- '- OS: %s %s\n' "$(uname -s)" "$(uname -r)"
+        printf -- '- Architecture: %s\n' "$(uname -m)"
+        command -v rustc >/dev/null 2>&1 && printf -- '- Rust: %s\n' "$(rustc --version)"
+        printf -- '- tmux: %s\n' "$("$tmux_binary" -V)"
+        printf -- '- tmux revision: %s\n' "${TMNOTIFY_TMUX_REVISION:-unknown}"
+        echo '- Isolation: explicit temporary -S socket and -f /dev/null'
+        echo '- Redaction: control streams and pane output are not retained'
+        echo
+        echo '| Checks | Result |'
+        echo '|---|---|'
+        printf '| TMUX-CAPABILITIES, TMUX-TOPOLOGY, TMUX-FOLLOW, TMUX-FOCUS, TMUX-STACKING, TMUX-PANE-LIFECYCLE, TMUX-RACE, TMUX-RECONNECT, TMUX-SHUTDOWN | %s |\n' "$probe_status"
+    } > "$report"
 }
 
 cleanup() {
@@ -34,6 +47,7 @@ cleanup() {
     "$tmux_binary" -S "$socket" kill-server >/dev/null 2>&1 || true
     exec 3>&- 4>&- 5>&- 6>&- 2>/dev/null || true
     for pid in $control_pids; do
+        kill "$pid" 2>/dev/null || true
         wait "$pid" 2>/dev/null || true
     done
     rm -rf "$test_directory"
@@ -75,8 +89,8 @@ pane_exists() {
     run_tmux list-panes -a -F '#{pane_id}' | grep -qx "$pane"
 }
 
-run_tmux new-session -d -s shared
-run_tmux new-session -d -s distinct
+run_tmux new-session -d -s shared 'sleep 300'
+run_tmux new-session -d -s distinct 'sleep 300'
 
 mkfifo "$control_one_input" "$control_two_input" "$control_three_input"
 exec 3<>"$control_one_input"
@@ -228,6 +242,7 @@ control_one_name=$(awk -v session="$shared_session" '$2 == session { print $1; e
 run_tmux detach-client -t "$control_one_name"
 wait_for 'one control client disconnect' has_control_clients 2
 exec 3>&-
+kill "$control_one_pid" 2>/dev/null || true
 wait "$control_one_pid" 2>/dev/null || true
 mkfifo "$control_reconnect_input"
 exec 6<>"$control_reconnect_input"
@@ -246,6 +261,7 @@ wait_for 'first control client shutdown event' output_contains "$control_two_out
 wait_for 'second control client shutdown event' output_contains "$control_three_output" '^%exit'
 wait_for 'reconnected control client shutdown event' output_contains "$control_reconnect_output" '^%exit'
 exec 4>&- 5>&- 6>&-
+kill "$control_two_pid" "$control_three_pid" "$control_reconnect_pid" 2>/dev/null || true
 wait "$control_two_pid"
 wait "$control_three_pid"
 wait "$control_reconnect_pid"
@@ -254,4 +270,5 @@ if "$tmux_binary" -S "$socket" -f /dev/null list-sessions >/dev/null 2>&1; then
     exit 1
 fi
 
+probe_status=PASS
 echo "isolated tmux acceptance probe passed: $socket"

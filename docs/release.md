@@ -56,11 +56,37 @@ indexed in `docs/acceptance-matrix.md`.
 
 ## Required interactive release smoke
 
-Run this checklist on Linux and macOS with tmux 3.8 or the recorded pinned
-commit. Use a disposable socket (`tmux -L tmnotify-release-smoke -f /dev/null`)
-and disposable XDG directories. Record the OS, architecture, tmux commit or
-version, and each result in the release notes. Do not publish when any required
-item fails.
+Run `scripts/test-interactive-smoke.sh` on Linux and macOS with tmux 3.8 or the
+recorded pinned commit. The harness uses only an explicit temporary `-S` socket
+with `-f /dev/null`, disposable XDG directories and HOME, and tmux/script PTYs.
+It never addresses the default tmux server or real Claude/Codex configuration.
+Set `TMNOTIFY_INTERACTIVE_ARTIFACT_DIR` to
+retain a sanitized Markdown report containing OS, architecture, Rust, tmux
+version/revision, command classes, and results. Terminal captures, Notification
+content, provider input, IDs, credentials, and renderer tokens are never
+written to the report.
+
+Linux can be exercised locally:
+
+```console
+cargo build --locked --release
+TMNOTIFY_TMUX_REVISION=d44bfda26d2468b5f474087b56f93eda34c541b6 \
+TMNOTIFY_INTERACTIVE_ARTIFACT_DIR=target/interactive-smoke \
+  scripts/test-interactive-smoke.sh /path/to/pinned/tmux target/release/tmnotify
+```
+
+For macOS, manually dispatch the **Interactive release smoke** workflow. Its
+`macOS RS-01..RS-10 (arm64)` and `(x86_64)` jobs build the pinned next-3.8
+revision, run the same PTY harness and focused failure probes, and upload only
+the sanitized report. Download both artifacts and require all RS rows to be
+PASS before release.
+
+No checklist item requires human terminal input. PTY automation covers client
+attachment, History resize/key/signal paths, and Attention input. The only
+human step is dispatching the macOS workflow (GitHub Actions → Interactive
+release smoke → Run workflow) because this branch is intentionally not pushed
+by the harness and GitHub-hosted macOS hardware is external to a local Linux
+checkout.
 
 1. **RS-01 — lazy daemon and races:** issue two first `send` commands
    concurrently; observe one daemon and one History row per request.
