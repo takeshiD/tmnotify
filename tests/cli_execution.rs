@@ -11,6 +11,16 @@ use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 
 use tempfile::TempDir;
 
+#[cfg(unix)]
+/// Keeps socket fixtures below macOS `SUN_LEN`; callers deliberately retain
+/// their ordinary `TempDir` for HOME, configuration, and state path coverage.
+fn short_socket_directory() -> TempDir {
+    tempfile::Builder::new()
+        .prefix("tmnotify-cli-sockets-")
+        .tempdir_in("/tmp")
+        .expect("create a short, unique RAII-owned Unix socket directory")
+}
+
 fn binary() -> Command {
     Command::new(env!("CARGO_BIN_EXE_tmnotify"))
 }
@@ -130,10 +140,12 @@ fn config_reload_requires_an_existing_selected_daemon() {
     use std::os::unix::net::UnixListener;
 
     let temporary = TempDir::new().unwrap();
-    let tmux_socket = temporary.path().join("tmux.sock");
+    let sockets = short_socket_directory();
+    let tmux_socket = sockets.path().join("tmux.sock");
     let _listener = UnixListener::bind(&tmux_socket).unwrap();
     let mut command = binary();
     private_environment(&mut command, &temporary);
+    command.env("XDG_RUNTIME_DIR", sockets.path().join("runtime"));
     let output = command
         .arg("-S")
         .arg(tmux_socket)
@@ -154,7 +166,8 @@ fn config_reload_reports_plain_and_json_daemon_acknowledgements() {
     use tmnotify::platform::{Environment, PlatformPaths};
 
     let temporary = TempDir::new().unwrap();
-    let tmux_socket = temporary.path().join("tmux.sock");
+    let sockets = short_socket_directory();
+    let tmux_socket = sockets.path().join("tmux.sock");
     let _tmux_listener = UnixListener::bind(&tmux_socket).unwrap();
     let environment = Environment::from_pairs([
         (
@@ -171,7 +184,7 @@ fn config_reload_reports_plain_and_json_daemon_acknowledgements() {
         ),
         (
             OsString::from("XDG_RUNTIME_DIR"),
-            temporary.path().join("runtime").into_os_string(),
+            sockets.path().join("runtime").into_os_string(),
         ),
     ]);
     let paths = PlatformPaths::resolve(&environment).unwrap();
@@ -188,6 +201,7 @@ fn config_reload_reports_plain_and_json_daemon_acknowledgements() {
 
     let mut plain = binary();
     private_environment(&mut plain, &temporary);
+    plain.env("XDG_RUNTIME_DIR", sockets.path().join("runtime"));
     let output = plain
         .arg("-S")
         .arg(&tmux_socket)
@@ -204,6 +218,7 @@ fn config_reload_reports_plain_and_json_daemon_acknowledgements() {
 
     let mut json = binary();
     private_environment(&mut json, &temporary);
+    json.env("XDG_RUNTIME_DIR", sockets.path().join("runtime"));
     let output = json
         .arg("-S")
         .arg(tmux_socket)
@@ -262,10 +277,12 @@ fn attention_outside_tmux_rejects_missing_source_before_daemon_start() {
     use std::os::unix::net::UnixListener;
 
     let temporary = TempDir::new().unwrap();
-    let tmux_socket = temporary.path().join("tmux.sock");
+    let sockets = short_socket_directory();
+    let tmux_socket = sockets.path().join("tmux.sock");
     let _listener = UnixListener::bind(&tmux_socket).unwrap();
     let mut command = binary();
     private_environment(&mut command, &temporary);
+    command.env("XDG_RUNTIME_DIR", sockets.path().join("runtime"));
     let output = command
         .arg("-S")
         .arg(&tmux_socket)

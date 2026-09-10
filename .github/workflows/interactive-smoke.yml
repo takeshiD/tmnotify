@@ -49,7 +49,7 @@ jobs:
           cd "$RUNNER_TEMP/tmux"
           sh autogen.sh
           PKG_CONFIG_PATH="$(brew --prefix libevent)/lib/pkgconfig:$(brew --prefix ncurses)/lib/pkgconfig" \
-            ./configure --prefix="$RUNNER_TEMP/tmux-install" --disable-utf8proc
+            ./configure --prefix="$RUNNER_TEMP/tmux-install" --disable-utf8proc --disable-jemalloc
           make -j2 install
       - name: Build release binary
         run: cargo build --locked --release
