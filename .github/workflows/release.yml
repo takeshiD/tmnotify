@@ -1,0 +1,96 @@
+name: Release artifacts
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: Build ${{ matrix.target }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+          - runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+          - runner: macos-15-intel
+            target: x86_64-apple-darwin
+          - runner: macos-14
+            target: aarch64-apple-darwin
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - name: Install stable Rust target
+        run: |
+          rustup toolchain install stable --profile minimal --target "${{ matrix.target }}"
+          rustup default stable
+      - name: Install reproducible archive tool on macOS
+        if: startsWith(matrix.target, 'x86_64-apple') || startsWith(matrix.target, 'aarch64-apple')
+        run: brew install gnu-tar
+      - name: Validate release version
+        run: |
+          version=$(sed -n 's/^version = "\([^"]*\)"$/\1/p' Cargo.toml | head -n 1)
+          test -n "$version"
+          if [ "$GITHUB_EVENT_NAME" = push ]; then
+            test "$GITHUB_REF_NAME" = "v$version"
+          fi
+      - name: Build release binary
+        run: cargo build --locked --release --target "${{ matrix.target }}"
+      - name: Smoke-test release command surface
+        run: scripts/smoke-release.sh "target/${{ matrix.target }}/release/tmnotify"
+      - name: Package reproducibly
+        run: |
+          version=$(sed -n 's/^version = "\([^"]*\)"$/\1/p' Cargo.toml | head -n 1)
+          SOURCE_DATE_EPOCH=$(git show -s --format=%ct HEAD)
+          export SOURCE_DATE_EPOCH
+          scripts/package-release.sh "${{ matrix.target }}" "target/${{ matrix.target }}/release/tmnotify" dist
+          scripts/package-release.sh "${{ matrix.target }}" "target/${{ matrix.target }}/release/tmnotify" "$RUNNER_TEMP/repeat"
+          cmp "dist/tmnotify-$version-${{ matrix.target }}.tar.gz" "$RUNNER_TEMP/repeat/tmnotify-$version-${{ matrix.target }}.tar.gz"
+      - name: Write SHA-256 checksum
+        working-directory: dist
+        run: |
+          version=$(sed -n 's/^version = "\([^"]*\)"$/\1/p' ../Cargo.toml | head -n 1)
+          archive="tmnotify-$version-${{ matrix.target }}.tar.gz"
+          shasum -a 256 "$archive" > "$archive.sha256"
+      - name: Smoke-test packaged executable
+        run: |
+          version=$(sed -n 's/^version = "\([^"]*\)"$/\1/p' Cargo.toml | head -n 1)
+          mkdir "$RUNNER_TEMP/smoke"
+          tar -xzf "dist/tmnotify-$version-${{ matrix.target }}.tar.gz" -C "$RUNNER_TEMP/smoke"
+          scripts/smoke-release.sh "$RUNNER_TEMP/smoke/tmnotify-$version-${{ matrix.target }}/tmnotify"
+      - name: Upload verified artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: tmnotify-${{ matrix.target }}
+          path: |
+            dist/*.tar.gz
+            dist/*.sha256
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    name: Publish GitHub Release
+    if: github.event_name == 'push' && github.ref_type == 'tag'
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          pattern: tmnotify-*
+          path: dist
+          merge-multiple: true
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" dist/* --repo "$GITHUB_REPOSITORY" --verify-tag --generate-notes

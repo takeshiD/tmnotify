@@ -20,6 +20,7 @@ durable History, and can return the user to the Source Pane.
 ```bash
 tmnotify send "build finished"
 tmnotify send --attention "Codex needs input"
+tmnotify jump --key build
 tmnotify history
 tmnotify hook install claude
 tmnotify hook install codex
@@ -120,10 +121,10 @@ Persistence is independent of delivery state. When History is enabled, a row
 is created when a request is accepted and updated as the Notification changes.
 `Archived` is not a lifecycle state.
 
-`Jumped` is a close reason only when active Attention causes the jump. Jumping
-later from History preserves the original close reason and updates only
-`last_jumped_at`. A missing Source Pane produces a nonfatal UI error and does
-not rewrite the lifecycle.
+`Jumped` is a close reason when an active Notification causes the jump, either
+from Attention or `jump --key`. Jumping later from History preserves the
+original close reason and updates only `last_jumped_at`. A missing Source Pane
+produces a nonfatal UI error and does not rewrite the lifecycle.
 
 ### 3.2 Safe text boundary
 
@@ -179,6 +180,20 @@ For Pending or Visible Notifications:
 
 `created_at` remains stable and `updated_at` changes. Once Closed, the same key
 creates a new Notification and History row.
+
+A live keyed Notification can be used as a stable direct-jump handle:
+
+```bash
+tmnotify jump --key build
+```
+
+The command resolves only the live key in the selected tmux server. It requires
+a valid Source Context, resolves the Source Pane current location by pane ID,
+closes the Notification as Jumped after a successful switch, and closes all of
+its Window Displays. A missing live key, absent Source Context, missing pane, or
+failed switch is a nonzero direct-command error and leaves the Notification
+open. Closed rows remain reachable through History rather than by key, avoiding
+ambiguity when a key has been reused.
 
 ### 3.5 Agent event model
 
@@ -245,8 +260,11 @@ state. This is an explicit best-effort limitation.
 
 ## 5. Toast behavior
 
-Toasts never steal focus and are not interactive. Jumping from a Toast is done
-through History.
+Toasts never steal focus and their display surface is not interactive. A Toast
+with a Notification Key can be jumped to from another pane or a user-defined
+tmux key binding by invoking `tmnotify jump --key <key>`; otherwise jumping is
+done through History. tmnotify does not install or mutate global tmux key
+bindings.
 
 ```toml
 [toast]
@@ -656,6 +674,7 @@ disable = []
 tmnotify [-L NAME|-S PATH] send [OPTIONS] <MESSAGE|->
 tmnotify [-L NAME|-S PATH] update (--id ID|--key KEY) [OPTIONS] [MESSAGE|-]
 tmnotify [-L NAME|-S PATH] dismiss (--id ID|--key KEY)
+tmnotify [-L NAME|-S PATH] jump --key KEY
 tmnotify [-L NAME|-S PATH] history [--plain|--json|--all|--all-servers]
 tmnotify history clear <FILTER> [--yes]
 tmnotify hook install <claude|codex> [SCOPE]
@@ -688,6 +707,8 @@ Send defaults are Info, Normal, Toast, and automatic Source capture. Options:
 
 There is no `--modal`; attention describes intent while modal is an
 implementation detail. Update/dismiss require explicit `--id` or `--key`.
+Direct jump intentionally requires `--key`, addresses only a live Notification
+in the selected server, and never guesses a closed History row.
 
 ## 16. Provider hooks
 
@@ -961,6 +982,8 @@ Homebrew is deferred until artifact and upgrade behavior are stable.
 - displays follow window changes without restarting timeout;
 - stacking, placements, narrow fallback, animation, update, persistent timeout,
   and dismiss match this document;
+- a live keyed Toast can jump to its Source Pane through `jump --key`, then
+  closes every Window Display as Jumped;
 - History records accepted Notifications when enabled.
 
 ### Attention
