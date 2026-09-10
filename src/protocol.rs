@@ -33,6 +33,7 @@ pub enum RequestKind {
     HistoryGuard,
     HistoryJump,
     HistoryClear,
+    ConfigReload,
     RendererRedeem,
 }
 
@@ -47,6 +48,7 @@ impl RequestKind {
             "history-guard" => Some(Self::HistoryGuard),
             "history-jump" => Some(Self::HistoryJump),
             "history-clear" => Some(Self::HistoryClear),
+            "config-reload" => Some(Self::ConfigReload),
             "renderer-redeem" => Some(Self::RendererRedeem),
             _ => None,
         }
@@ -209,6 +211,7 @@ pub enum ClientCommand {
         selector: WireHistoryClear,
         all_servers: bool,
     },
+    ConfigReload,
 }
 
 impl ClientCommand {
@@ -222,6 +225,7 @@ impl ClientCommand {
             Self::HistoryGuard => RequestKind::HistoryGuard,
             Self::HistoryJump { .. } => RequestKind::HistoryJump,
             Self::HistoryClear { .. } => RequestKind::HistoryClear,
+            Self::ConfigReload => RequestKind::ConfigReload,
         }
     }
 
@@ -244,7 +248,10 @@ impl ClientCommand {
                 Err(ProtocolError::InvalidHistoryLimit)
             }
             Self::HistoryJump { source } => source.clone().into_domain().map(|_| ()),
-            Self::History { .. } | Self::HistoryGuard | Self::HistoryClear { .. } => Ok(()),
+            Self::History { .. }
+            | Self::HistoryGuard
+            | Self::HistoryClear { .. }
+            | Self::ConfigReload => Ok(()),
         }
     }
 }
@@ -1508,6 +1515,16 @@ mod tests {
             ClientRequest::from_envelope(&envelope),
             Err(ProtocolError::InvalidHistoryLimit)
         ));
+    }
+
+    #[test]
+    fn config_reload_round_trips_as_a_versioned_bounded_request() {
+        let request = ClientRequest::new(ClientCommand::ConfigReload);
+        let line = request.encode_line().unwrap();
+        assert!(line.len() <= MAX_REQUEST_BYTES + 1);
+        let envelope = RequestEnvelope::decode(&line[..line.len() - 1]).unwrap();
+        assert_eq!(envelope.kind, RequestKind::ConfigReload);
+        assert_eq!(ClientRequest::from_envelope(&envelope).unwrap(), request);
     }
 
     #[test]

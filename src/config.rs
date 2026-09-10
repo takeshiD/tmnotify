@@ -5,7 +5,7 @@ use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 #[cfg(unix)]
 use std::os::unix::fs::MetadataExt;
 use thiserror::Error;
@@ -14,7 +14,7 @@ use crate::platform::{Environment, PathError, open_private_read};
 
 const MAX_CONFIG_BYTES: u64 = 256 * 1024;
 
-#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq)]
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Config {
     pub daemon: DaemonConfig,
@@ -118,7 +118,7 @@ fn validate_timeout(
     }
 }
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct DaemonConfig {
     pub idle_timeout: IdleTimeout,
@@ -132,13 +132,13 @@ impl Default for DaemonConfig {
     }
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum IdleTimeout {
     Never,
 }
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct QueueConfig {
     pub max_pending: u32,
@@ -150,7 +150,7 @@ impl Default for QueueConfig {
     }
 }
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct ToastConfig {
     pub position: Placement,
@@ -180,7 +180,7 @@ impl Default for ToastConfig {
     }
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum Placement {
     TopLeft,
@@ -191,14 +191,14 @@ pub enum Placement {
     BottomRight,
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum StackOrder {
     OldestFirst,
     NewestFirst,
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum BodyPresentation {
     FirstLine,
@@ -206,7 +206,7 @@ pub enum BodyPresentation {
     Wrap,
 }
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct AnimationConfig {
     pub enabled: bool,
@@ -230,14 +230,14 @@ impl Default for AnimationConfig {
     }
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum Easing {
     EaseIn,
     EaseOut,
 }
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct AttentionConfig {
     pub width: Percentage,
@@ -259,7 +259,7 @@ impl Default for AttentionConfig {
     }
 }
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct HistoryConfig {
     pub enabled: bool,
@@ -275,7 +275,7 @@ impl Default for HistoryConfig {
     }
 }
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct DisplayConfig {
     pub color: FeatureMode,
@@ -291,7 +291,7 @@ impl Default for DisplayConfig {
     }
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum FeatureMode {
     Auto,
@@ -299,14 +299,14 @@ pub enum FeatureMode {
     Never,
 }
 
-#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq)]
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct HooksConfig {
     pub claude: HookProviderConfig,
     pub codex: HookProviderConfig,
 }
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct HookProviderConfig {
     pub preset: HookPreset,
@@ -324,7 +324,7 @@ impl Default for HookProviderConfig {
     }
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum HookPreset {
     Minimal,
@@ -332,7 +332,7 @@ pub enum HookPreset {
     Verbose,
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum HookEvent {
     NeedsAttention,
@@ -360,6 +360,15 @@ impl<'de> Deserialize<'de> for DurationValue {
     }
 }
 
+impl Serialize for DurationValue {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_str(&format_duration(self.0))
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum TimeoutValue {
     After(DurationValue),
@@ -383,6 +392,18 @@ impl<'de> Deserialize<'de> for TimeoutValue {
     }
 }
 
+impl Serialize for TimeoutValue {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        match self {
+            Self::After(duration) => duration.serialize(serializer),
+            Self::Never => serializer.serialize_str("never"),
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Percentage(pub u32);
 
@@ -399,6 +420,25 @@ impl<'de> Deserialize<'de> for Percentage {
             .map_err(serde::de::Error::custom)?;
         Ok(Self(number))
     }
+}
+
+impl Serialize for Percentage {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_str(&format!("{}%", self.0))
+    }
+}
+
+fn format_duration(duration: Duration) -> String {
+    let milliseconds = duration.as_millis();
+    for (unit, divisor) in [("h", 3_600_000_u128), ("m", 60_000), ("s", 1_000)] {
+        if milliseconds != 0 && milliseconds.is_multiple_of(divisor) {
+            return format!("{}{unit}", milliseconds / divisor);
+        }
+    }
+    format!("{milliseconds}ms")
 }
 
 fn parse_duration(value: &str) -> Result<Duration, &'static str> {
@@ -482,6 +522,15 @@ pub fn load(
     Ok(config)
 }
 
+/// Serializes a complete effective configuration in declaration order.
+///
+/// The output is intentionally canonical rather than preserving user spelling,
+/// comments, or table order, so scripts receive the same TOML for equivalent
+/// validated configurations.
+pub fn to_stable_toml(config: &Config) -> Result<String, ConfigError> {
+    toml::to_string_pretty(config).map_err(ConfigError::Serialize)
+}
+
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct ConfigChanges {
     pub daemon_or_queue: bool,
@@ -546,6 +595,21 @@ impl ConfigManager {
             Ok(candidate) => candidate,
             Err(_) => return Ok(ReloadOutcome::Rejected),
         };
+        Ok(self.replace(candidate))
+    }
+
+    /// Re-reads the configured path regardless of its last observed metadata.
+    /// A failed load leaves the active last-known-good snapshot untouched.
+    pub fn reload_now(&mut self) -> Result<ReloadOutcome, ConfigError> {
+        self.observed = fingerprint(&self.path)?;
+        let candidate = load(&self.path, &self.environment, self.cli)?;
+        Ok(self.replace(candidate))
+    }
+
+    fn replace(&mut self, candidate: Config) -> ReloadOutcome {
+        if candidate == self.active {
+            return ReloadOutcome::Unchanged;
+        }
         let changes = ConfigChanges {
             daemon_or_queue: candidate.daemon != self.active.daemon
                 || candidate.queue != self.active.queue,
@@ -556,7 +620,7 @@ impl ConfigManager {
             hooks_require_sync: candidate.hooks != self.active.hooks,
         };
         self.active = candidate;
-        Ok(ReloadOutcome::Reloaded(changes))
+        ReloadOutcome::Reloaded(changes)
     }
 }
 
@@ -591,6 +655,8 @@ pub enum ConfigError {
     TooLarge,
     #[error("invalid configuration: {0}")]
     Parse(toml::de::Error),
+    #[error("failed to serialize effective configuration: {0}")]
+    Serialize(toml::ser::Error),
     #[error("invalid private configuration path: {0}")]
     PrivatePath(PathError),
     #[error("{field} must be between {minimum} and {maximum}")]
@@ -652,6 +718,31 @@ mod tests {
         )
         .expect("defaults");
         assert_eq!(config, Config::default());
+    }
+
+    #[test]
+    fn stable_toml_is_complete_deterministic_and_round_trips() {
+        let config = Config::default();
+        let first = to_stable_toml(&config).expect("TOML");
+        let second = to_stable_toml(&config).expect("TOML");
+        assert_eq!(first, second);
+        assert_eq!(toml::from_str::<Config>(&first).unwrap(), config);
+        for table in [
+            "[daemon]",
+            "[queue]",
+            "[toast]",
+            "[toast.animation]",
+            "[attention]",
+            "[history]",
+            "[display]",
+            "[hooks.claude]",
+            "[hooks.codex]",
+        ] {
+            assert!(first.contains(table), "missing {table} in {first}");
+        }
+        assert!(first.contains("timeout = \"3s\""));
+        assert!(first.contains("enter_duration = \"180ms\""));
+        assert!(first.ends_with('\n'));
     }
 
     #[test]
@@ -720,6 +811,8 @@ mod tests {
             ReloadOutcome::Rejected
         );
         assert_eq!(manager.active().toast.width, 50);
+        assert!(manager.reload_now().is_err());
+        assert_eq!(manager.active().toast.width, 50);
     }
 
     #[test]
@@ -755,6 +848,20 @@ mod tests {
         assert!(matches!(
             load(&path, &empty_environment(), Default::default()),
             Err(ConfigError::PrivatePath(PathError::InsecurePermissions(_)))
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rejects_symlinked_user_configuration() {
+        let temp = tempfile::tempdir().expect("temporary directory");
+        let target = temp.path().join("target.toml");
+        let path = temp.path().join("config.toml");
+        write_config(&target, "");
+        std::os::unix::fs::symlink(&target, &path).expect("symlink");
+        assert!(matches!(
+            load(&path, &empty_environment(), Default::default()),
+            Err(ConfigError::PrivatePath(PathError::SymbolicLink(_)))
         ));
     }
 }

@@ -311,6 +311,7 @@ fn safe_config_error(error: &ConfigError) -> &'static str {
     match error {
         ConfigError::TooLarge => "configuration exceeds its size limit",
         ConfigError::Parse(_) => "configuration contains an unknown field or invalid value",
+        ConfigError::Serialize(_) => "configuration could not be serialized",
         ConfigError::PrivatePath(_) => {
             "configuration path ownership, type, or permissions are unsafe"
         }

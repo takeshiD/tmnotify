@@ -149,6 +149,18 @@ async fn history_daemon_request(
     }
 }
 
+/// Sends an explicit reload request to an already-running selected daemon.
+/// Unlike ordinary notification submission, this never starts a daemon.
+pub async fn request_config_reload(socket: &Path) -> Result<serde_json::Value, ConfigReloadError> {
+    history_daemon_request(socket, ClientCommand::ConfigReload)
+        .await
+        .map_err(|error| ConfigReloadError(error.to_string()))
+}
+
+#[derive(Debug, Error)]
+#[error("{0}")]
+pub struct ConfigReloadError(String);
+
 #[derive(Debug, Error)]
 enum HistoryRequestError {
     #[error("tmnotify daemon is unavailable: {0}")]
@@ -256,9 +268,18 @@ async fn run_inner(
         let service = handler_service.clone();
         let config_reload = config_reload.clone();
         async move {
-            config_reload.reload().await;
+            let request =
+                ClientRequest::from_envelope(&envelope).map_err(|error| error.to_string())?;
+            if matches!(request.command, ClientCommand::ConfigReload) {
+                let changed = config_reload.reload_now().await?;
+                return Ok(serde_json::json!({
+                    "accepted": true,
+                    "changed": changed,
+                }));
+            }
+            config_reload.reload_if_changed().await;
             service
-                .handle_envelope(&envelope, monotonic(origin), Utc::now())
+                .handle(request.command, monotonic(origin), Utc::now())
                 .await
                 .and_then(|response| serde_json::to_value(response).map_err(Into::into))
                 .map_err(|error| error.to_string())
@@ -398,7 +419,7 @@ async fn reconcile_loop(
     let mut next_config_reload = Instant::now() + display.config_reload.interval;
     while !stopping.load(Ordering::Acquire) {
         if Instant::now() >= next_config_reload {
-            display.config_reload.reload().await;
+            display.config_reload.reload_if_changed().await;
             next_config_reload = Instant::now() + display.config_reload.interval;
         }
         if display.settings_receiver.has_changed().unwrap_or(false) {
@@ -430,30 +451,49 @@ struct LiveConfigReload {
 }
 
 impl LiveConfigReload {
-    async fn reload(&self) {
-        let update = {
+    async fn reload_if_changed(&self) {
+        if self.perform(false).await.is_err() {
+            let _ = self
+                .logger
+                .write(LogLevel::Warning, LogEvent::InvalidConfiguration);
+        }
+    }
+
+    async fn reload_now(&self) -> Result<bool, String> {
+        self.perform(true).await.inspect_err(|_| {
+            let _ = self
+                .logger
+                .write(LogLevel::Warning, LogEvent::InvalidConfiguration);
+        })
+    }
+
+    async fn perform(&self, force: bool) -> Result<bool, String> {
+        let (outcome, update) = {
             let mut manager = self.manager.lock().await;
-            match manager.reload_if_changed() {
-                Ok(ReloadOutcome::Reloaded(changes))
+            let outcome = if force {
+                manager.reload_now()
+            } else {
+                manager.reload_if_changed()
+            }
+            .map_err(|error| error.to_string())?;
+            let update = match &outcome {
+                ReloadOutcome::Reloaded(changes)
                     if changes.display_reconciliation || changes.daemon_or_queue =>
                 {
-                    Some(DaemonSettings::from_config(
-                        manager.active(),
-                        &self.environment,
-                    ))
+                    Some(
+                        DaemonSettings::from_config(manager.active(), &self.environment)
+                            .map_err(|error| error.to_string())?,
+                    )
                 }
-                Ok(ReloadOutcome::Rejected) | Err(_) => {
-                    let _ = self
-                        .logger
-                        .write(LogLevel::Warning, LogEvent::InvalidConfiguration);
-                    None
-                }
-                Ok(ReloadOutcome::Unchanged | ReloadOutcome::Reloaded(_)) => None,
-            }
+                ReloadOutcome::Rejected => return Err("configuration reload was rejected".into()),
+                ReloadOutcome::Unchanged | ReloadOutcome::Reloaded(_) => None,
+            };
+            (outcome, update)
         };
-        if let Some(Ok(settings)) = update {
+        if let Some(settings) = update {
             self.settings_sender.send_replace(settings);
         }
+        Ok(matches!(outcome, ReloadOutcome::Reloaded(_)))
     }
 }
 
@@ -691,7 +731,7 @@ mod tests {
             &config_path,
             "[queue]\nmax_pending = 7\n\n[toast]\nwidth = 50\nmax_visible = 2\nposition = \"bottom-left\"\n\n[hooks.codex]\npreset = \"normal\"\n",
         );
-        reload.reload().await;
+        assert!(reload.reload_now().await.unwrap());
         assert!(receiver.has_changed().unwrap());
         let settings = *receiver.borrow_and_update();
         assert_eq!(settings.display_policy.toast_width, 50);
@@ -703,12 +743,14 @@ mod tests {
             crate::config::HookPreset::Normal
         );
         assert!(!temporary.path().join(".codex/hooks.json").exists());
+        assert!(!reload.reload_now().await.unwrap());
+        assert!(!receiver.has_changed().unwrap());
 
         write_private(
             &config_path,
             "[toast]\nwidth = 2\nposition = \"top-center\"\n# invalid snapshot is longer\n",
         );
-        reload.reload().await;
+        assert!(reload.reload_now().await.is_err());
         assert!(!receiver.has_changed().unwrap());
         assert_eq!(manager.lock().await.active().toast.width, 50);
         assert!(

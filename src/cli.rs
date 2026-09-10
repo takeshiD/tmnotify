@@ -50,6 +50,7 @@ pub enum Command {
     /// Jump to the Source Pane of a live keyed Notification.
     Jump(JumpArgs),
     History(HistoryArgs),
+    Config(ConfigArgs),
     Hook(HookArgs),
     Doctor(DoctorArgs),
     #[command(name = "__daemon", hide = true)]
@@ -62,6 +63,27 @@ pub enum Command {
     HistoryUi(HistoryUiArgs),
     #[command(name = "__hook-event", hide = true)]
     HookEvent(HookEventArgs),
+}
+
+#[derive(Debug, Args, PartialEq)]
+pub struct ConfigArgs {
+    #[command(subcommand)]
+    pub action: ConfigAction,
+}
+
+#[derive(Debug, Subcommand, PartialEq)]
+pub enum ConfigAction {
+    /// Print the complete effective user configuration as stable TOML.
+    Show,
+    /// Ask the selected running daemon to reload the user configuration now.
+    Reload(ConfigReloadArgs),
+}
+
+#[derive(Debug, Args, PartialEq)]
+pub struct ConfigReloadArgs {
+    /// Print the daemon acknowledgement as JSON.
+    #[arg(long)]
+    pub json: bool,
 }
 
 #[derive(Debug, Args, PartialEq)]
@@ -539,6 +561,25 @@ mod tests {
         assert!(parse_from(["tmnotify", "jump"]).is_err());
         let cli = parse_from(["tmnotify", "jump", "--key", "build"]).unwrap();
         assert!(matches!(cli.command, Command::Jump(JumpArgs { key, .. }) if key == "build"));
+    }
+
+    #[test]
+    fn config_commands_parse_with_json_only_on_reload() {
+        assert!(matches!(
+            parse_from(["tmnotify", "config", "show"]).unwrap().command,
+            Command::Config(ConfigArgs {
+                action: ConfigAction::Show
+            })
+        ));
+        assert_eq!(
+            parse_from(["tmnotify", "config", "reload", "--json"])
+                .unwrap()
+                .command,
+            Command::Config(ConfigArgs {
+                action: ConfigAction::Reload(ConfigReloadArgs { json: true }),
+            })
+        );
+        assert!(parse_from(["tmnotify", "config", "show", "--json"]).is_err());
     }
 
     #[test]

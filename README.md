@@ -10,6 +10,83 @@ tmnotify jump --key build
 tmnotify history
 ```
 
+## Configuration
+
+tmnotify reads one user configuration from
+`$XDG_CONFIG_HOME/tmnotify/config.toml`, falling back to
+`~/.config/tmnotify/config.toml`. Print the validated effective configuration,
+including defaults, without tmux or a running daemon:
+
+```console
+tmnotify config show
+```
+
+Reload the file into an already-running daemon selected by the same `-L`, `-S`,
+or `$TMUX` rules as other display commands:
+
+```console
+tmnotify config reload
+tmnotify -L work config reload --json
+```
+
+The plain acknowledgement is `changed` or `unchanged`; JSON includes
+`accepted` and `changed`. Invalid or unsafe files fail without replacing the
+daemon's last-known-good configuration. Hook preset changes take effect in
+provider files only after an explicit `tmnotify hook sync`.
+
+A complete configuration is:
+
+```toml
+[daemon]
+idle_timeout = "never"
+
+[queue]
+max_pending = 1000
+
+[toast]
+position = "top-right"
+width = 42
+height = 3
+timeout = "3s"
+max_visible = 4
+gap = 1
+stack_order = "oldest-first"
+body = "first-line"
+
+[toast.animation]
+enabled = true
+fps = 20
+enter_duration = "180ms"
+exit_duration = "150ms"
+enter_easing = "ease-out"
+exit_easing = "ease-in"
+
+[attention]
+width = "60%"
+minimum_width = 32
+minimum_height = 7
+capture_all_keys = true
+close_on_outside_click = false
+
+[history]
+enabled = true
+max_entries = 10000
+
+[display]
+color = "auto"
+unicode = "auto"
+
+[hooks.claude]
+preset = "minimal"
+enable = []
+disable = []
+
+[hooks.codex]
+preset = "minimal"
+enable = []
+disable = []
+```
+
 A key binding can invoke the same safe, key-based jump without putting
 Notification text in a shell command:
 
