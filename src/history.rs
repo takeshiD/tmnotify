@@ -26,7 +26,7 @@ use crate::notification::{
     NotificationId, NotificationKey, Presentation, Priority, Provider, SourceContext, Timeout,
     TmuxServerId,
 };
-use crate::platform::{PathError, ensure_private_directory};
+use crate::platform::{PathError, prepare_private_file_path};
 
 const SCHEMA_VERSION: i64 = 1;
 const DEFAULT_QUEUE_CAPACITY: usize = 128;
@@ -229,12 +229,11 @@ impl History {
         }
 
         let path = path.as_ref();
-        let parent = path
-            .parent()
+        path.parent()
             .filter(|parent| !parent.as_os_str().is_empty())
             .ok_or_else(|| HistoryError::InvalidPath(path.to_owned()))?;
-        ensure_private_directory(parent)?;
-        let mut connection = open_connection(path)?;
+        let prepared_path = prepare_private_file_path(path)?;
+        let mut connection = open_connection(&prepared_path)?;
         migrate(&mut connection)?;
         if let Some(now) = recovery_time {
             recover_stale(&connection, &current_server, now)?;
@@ -1074,6 +1073,7 @@ impl fmt::Debug for History {
 mod tests {
     use super::*;
     use crate::notification::{NotificationDraft, Presentation};
+    use crate::platform::{Environment, PlatformPaths};
     use tempfile::TempDir;
 
     fn server(value: &str) -> TmuxServerId {
@@ -1097,6 +1097,66 @@ mod tests {
 
     fn history_path(temporary: &TempDir) -> PathBuf {
         temporary.path().join("state/history.sqlite3")
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn opens_platform_history_path_with_missing_parents_below_symlinked_temp_root() {
+        use std::os::unix::fs::symlink;
+
+        let temporary = TempDir::new().unwrap();
+        let real_root = temporary.path().join("real-root");
+        std::fs::create_dir(&real_root).unwrap();
+        let linked_root = temporary.path().join("linked-root");
+        symlink(&real_root, &linked_root).unwrap();
+
+        let environment = Environment::from_pairs([
+            (
+                "XDG_CONFIG_HOME".into(),
+                temporary.path().join("config").into_os_string(),
+            ),
+            (
+                "XDG_STATE_HOME".into(),
+                linked_root.join("state").into_os_string(),
+            ),
+        ]);
+        let paths = PlatformPaths::resolve(&environment).unwrap();
+        assert!(!paths.history_file.parent().unwrap().exists());
+
+        let history = History::open(
+            &paths.history_file,
+            server("alpha"),
+            &config(10_000),
+            Utc::now(),
+        )
+        .unwrap();
+
+        assert!(history.is_enabled());
+        assert!(paths.history_file.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rejects_symlinked_history_database_file() {
+        use std::os::unix::fs::symlink;
+
+        let temporary = TempDir::new().unwrap();
+        let path = history_path(&temporary);
+        crate::platform::ensure_private_directory(path.parent().unwrap()).unwrap();
+        let target = temporary.path().join("target.sqlite3");
+        std::fs::write(&target, []).unwrap();
+        symlink(&target, &path).unwrap();
+
+        let result = History::open(&path, server("alpha"), &config(10_000), Utc::now());
+
+        assert!(matches!(
+            result,
+            Err(HistoryError::Sqlite(rusqlite::Error::SqliteFailure(
+                error,
+                _
+            ))) if error.code == ErrorCode::CannotOpen && error.extended_code == 1550
+        ));
+        assert_eq!(std::fs::read(target).unwrap(), Vec::<u8>::new());
     }
 
     #[tokio::test]

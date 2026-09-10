@@ -187,6 +187,33 @@ pub fn ensure_private_directory(path: &Path) -> Result<(), PathError> {
     }
 }
 
+/// Prepares a private file's parent and returns a path with every existing
+/// ancestor resolved. This lets consumers retain no-follow file opens on
+/// platforms whose temporary-directory path contains a system symlink (for
+/// example, macOS `/var` -> `/private/var`). The final parent is still checked
+/// at both the supplied and canonical paths before the file is opened.
+pub(crate) fn prepare_private_file_path(path: &Path) -> Result<PathBuf, PathError> {
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .ok_or_else(|| PathError::UnexpectedFileType(path.to_owned()))?;
+    let file_name = path
+        .file_name()
+        .ok_or_else(|| PathError::UnexpectedFileType(path.to_owned()))?;
+    ensure_private_directory(parent)?;
+
+    let canonical_parent = fs::canonicalize(parent).map_err(|source| PathError::Io {
+        path: parent.to_owned(),
+        source,
+    })?;
+    let metadata = fs::symlink_metadata(&canonical_parent).map_err(|source| PathError::Io {
+        path: canonical_parent.clone(),
+        source,
+    })?;
+    validate_private_directory(&canonical_parent, &metadata)?;
+    Ok(canonical_parent.join(file_name))
+}
+
 fn create_private_directory(path: &Path) -> Result<(), PathError> {
     let parent = path
         .parent()
