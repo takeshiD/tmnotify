@@ -1087,7 +1087,7 @@ impl fmt::Debug for History {
 mod tests {
     use super::*;
     use crate::notification::{NotificationDraft, Presentation};
-    use crate::platform::{Environment, PlatformPaths};
+    use crate::platform::{Environment, PlatformPaths, ensure_private_directory};
     use tempfile::TempDir;
 
     fn server(value: &str) -> TmuxServerId {
