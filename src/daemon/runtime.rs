@@ -32,7 +32,7 @@ use crate::protocol::{
 use crate::render::{RendererSessions, RendererStream, WindowDisplayId};
 
 const SOCKET_MODE: u32 = 0o600;
-const DAEMON_START_TIMEOUT: Duration = Duration::from_secs(10);
+const DAEMON_COLD_START_TIMEOUT: Duration = Duration::from_secs(30);
 const DAEMON_START_INITIAL_DELAY: Duration = Duration::from_millis(10);
 const DAEMON_START_DELAY_STEP: Duration = Duration::from_millis(5);
 const DAEMON_START_MAX_DELAY_STEPS: u32 = 20;
@@ -830,7 +830,7 @@ pub async fn submit_lazy(
         Err(error) => return Err(error),
     }
     spawn_hidden_daemon(tmux_socket)?;
-    retry_daemon_start(DAEMON_START_TIMEOUT, || exchange(socket, request)).await
+    retry_daemon_start(DAEMON_COLD_START_TIMEOUT, || exchange(socket, request)).await
 }
 
 async fn retry_daemon_start<F, Fut>(
@@ -1025,7 +1025,7 @@ mod tests {
 
         assert_eq!(response, b"connected");
         assert_eq!(attempts.load(Ordering::SeqCst), 6);
-        assert_eq!(DAEMON_START_TIMEOUT, Duration::from_secs(10));
+        assert_eq!(DAEMON_COLD_START_TIMEOUT, Duration::from_secs(30));
     }
 
     #[tokio::test]
