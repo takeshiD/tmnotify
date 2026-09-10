@@ -14,7 +14,7 @@ binary=$1
 
 "$binary" --version
 help=$("$binary" --help)
-for command in send update dismiss jump history hook doctor; do
+for command in send update dismiss jump history config hook doctor; do
     printf '%s\n' "$help" | grep -q "  $command" || {
         echo "release binary help is missing command: $command" >&2
         exit 1
@@ -29,6 +29,9 @@ done
 
 "$binary" send --help >/dev/null
 "$binary" history --help >/dev/null
+"$binary" config --help >/dev/null
+"$binary" config show --help >/dev/null
+"$binary" config reload --help >/dev/null
 "$binary" hook --help >/dev/null
 "$binary" doctor --help >/dev/null
 

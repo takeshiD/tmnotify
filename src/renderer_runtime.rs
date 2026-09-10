@@ -148,7 +148,7 @@ impl<W: Write> ToastTerminal<W> {
         Ok(Self { output })
     }
 
-    fn draw(&mut self, content: &RendererContent) -> Result<(), RendererRuntimeError> {
+    fn draw(&mut self, content: &RendererContent) -> Result<(u16, u16), RendererRuntimeError> {
         if content.presentation() != crate::notification::Presentation::Toast {
             return Err(RendererRuntimeError::WrongPresentation);
         }
@@ -187,7 +187,7 @@ impl<W: Write> ToastTerminal<W> {
             self.output.write_all(line.as_bytes())?;
         }
         self.output.flush()?;
-        Ok(())
+        Ok((width, height))
     }
 }
 
@@ -226,13 +226,30 @@ fn run_toast<W: Write>(
 ) -> Result<(), RendererRuntimeError> {
     let mut terminal = ToastTerminal::enter(output)?;
     let interrupt = InterruptWatcher::new()?;
+    let mut current_content = None;
+    let mut rendered_size = None;
+    let mut settle_redraw = false;
     while !interrupt.is_interrupted() {
         match connection.poll()? {
             Some(RendererMessage::Initial { content } | RendererMessage::Update { content }) => {
-                terminal.draw(&content)?;
+                rendered_size = Some(terminal.draw(&content)?);
+                current_content = Some(content);
+                // tmux can launch the renderer before the new floating pane's
+                // final content dimensions are observable. Redraw once after
+                // the next IO poll even if no keyed update arrives.
+                settle_redraw = true;
             }
             Some(RendererMessage::Terminate { .. }) => return Ok(()),
-            Some(RendererMessage::Error { .. }) | None => {}
+            Some(RendererMessage::Error { .. }) => {}
+            None => {
+                let size = crossterm::terminal::size().unwrap_or((40, 1));
+                if let Some(content) = current_content.as_ref()
+                    && (settle_redraw || rendered_size != Some(size))
+                {
+                    rendered_size = Some(terminal.draw(content)?);
+                    settle_redraw = false;
+                }
+            }
         }
     }
     Ok(())
