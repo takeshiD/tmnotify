@@ -49,7 +49,7 @@ jobs:
           cd "$RUNNER_TEMP/tmux"
           sh autogen.sh
           PKG_CONFIG_PATH="$(brew --prefix libevent)/lib/pkgconfig:$(brew --prefix ncurses)/lib/pkgconfig" \
-            ./configure --prefix="$RUNNER_TEMP/tmux-install"
+            ./configure --prefix="$RUNNER_TEMP/tmux-install" --disable-utf8proc
           make -j2 install
       - name: Build release binary
         run: cargo build --locked --release
@@ -70,6 +70,10 @@ jobs:
           cargo test --locked history::tests::busy_retries_are_bounded
           cargo test --locked daemon::runtime::tests::renderer_aware_server_honors_forced_shutdown_during_cleanup
           cargo test --locked platform::tests::runtime_socket_rejects_non_socket_and_symlink_entries
+      - name: Verify sanitized smoke evidence
+        run: |
+          test -s "$RUNNER_TEMP/interactive-smoke/interactive-smoke.md"
+          test -s "$RUNNER_TEMP/tmux-probe/tmux-capabilities.md"
       - name: Upload sanitized smoke evidence
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
@@ -78,5 +82,5 @@ jobs:
           path: |
             ${{ runner.temp }}/interactive-smoke/interactive-smoke.md
             ${{ runner.temp }}/tmux-probe/tmux-capabilities.md
-          if-no-files-found: error
+          if-no-files-found: ignore
           retention-days: 14

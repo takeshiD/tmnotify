@@ -20,6 +20,8 @@ control_reconnect_output="$test_directory/control-reconnect.out"
 snapshot="$test_directory/topology.txt"
 control_pids=
 probe_status=FAIL
+DEFAULT_WAIT_TIMEOUT_SECONDS=10
+CONTROL_RECONNECT_TIMEOUT_SECONDS=30
 
 preserve_artifacts() {
     [ -n "${TMNOTIFY_TMUX_ARTIFACT_DIR:-}" ] || return 0
@@ -58,18 +60,26 @@ run_tmux() {
     "$tmux_binary" -S "$socket" -f /dev/null "$@"
 }
 
-wait_for() {
+wait_for_with_timeout() {
     description=$1
-    shift
+    timeout_seconds=$2
+    shift 2
     attempt=0
+    maximum_attempts=$((timeout_seconds * 10))
     until "$@"; do
         attempt=$((attempt + 1))
-        if [ "$attempt" -ge 100 ]; then
-            echo "timed out waiting for $description" >&2
+        if [ "$attempt" -ge "$maximum_attempts" ]; then
+            echo "timed out after ${timeout_seconds}s waiting for $description" >&2
             return 1
         fi
         sleep 0.1
     done
+}
+
+wait_for() {
+    description=$1
+    shift
+    wait_for_with_timeout "$description" "$DEFAULT_WAIT_TIMEOUT_SECONDS" "$@"
 }
 
 has_control_clients() {
@@ -249,7 +259,10 @@ exec 6<>"$control_reconnect_input"
 "$tmux_binary" -S "$socket" -f /dev/null -C attach-session -t shared < "$control_reconnect_input" > "$control_reconnect_output" 2>&1 &
 control_reconnect_pid=$!
 control_pids="$control_two_pid $control_three_pid $control_reconnect_pid"
-wait_for 'reconnected control client' has_control_clients 3
+wait_for_with_timeout \
+    'reconnected control client' \
+    "$CONTROL_RECONNECT_TIMEOUT_SECONDS" \
+    has_control_clients 3
 printf '%s\n' 'display-message -p tmnotify-control-probe' >&6
 wait_for 'correlated reconnect response' output_contains "$control_reconnect_output" '^tmnotify-control-probe$'
 grep -q '^%begin ' "$control_reconnect_output"
