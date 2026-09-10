@@ -41,10 +41,11 @@ rust_version=$(rustc --version)
 tmux_version=$("$tmux_binary" -V)
 
 test_directory=$(mktemp -d "${TMPDIR:-/tmp}/tmnotify-interactive.XXXXXXXX")
-socket="$test_directory/tmux.sock"
+socket_directory=$(mktemp -d /tmp/tmn-smoke.XXXXXXXX)
+socket="$socket_directory/tmux.sock"
 xdg_config="$test_directory/xdg-config"
 xdg_state="$test_directory/xdg-state"
-xdg_runtime="$test_directory/xdg-runtime"
+xdg_runtime="$socket_directory/xdg-runtime"
 fake_home="$test_directory/home"
 project="$test_directory/project"
 results="$test_directory/results.md"
@@ -60,7 +61,7 @@ cleanup() {
         mkdir -p "$artifact_directory"
         cp "$results" "$artifact_directory/interactive-smoke.md"
     fi
-    rm -rf "$test_directory"
+    rm -rf "$test_directory" "$socket_directory"
 }
 trap cleanup EXIT HUP INT TERM
 
