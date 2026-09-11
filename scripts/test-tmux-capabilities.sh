@@ -22,6 +22,15 @@ control_pids=
 probe_status=FAIL
 DEFAULT_WAIT_TIMEOUT_SECONDS=10
 CONTROL_RECONNECT_TIMEOUT_SECONDS=30
+detach_shared_index=${TMNOTIFY_TMUX_DETACH_SHARED_INDEX:-1}
+
+case $detach_shared_index in
+    1 | 2) ;;
+    *)
+        echo 'TMNOTIFY_TMUX_DETACH_SHARED_INDEX must be 1 or 2' >&2
+        exit 2
+        ;;
+esac
 
 preserve_artifacts() {
     [ -n "${TMNOTIFY_TMUX_ARTIFACT_DIR:-}" ] || return 0
@@ -248,17 +257,18 @@ wait "$race_two_pid"
 }
 
 # Drop one observer, reconnect it, and require fresh correlated control framing.
-control_one_name=$(awk -v session="$shared_session" '$2 == session { print $1; exit }' "$snapshot")
-run_tmux detach-client -t "$control_one_name"
+detached_client_name=$(awk \
+    -v session="$shared_session" \
+    -v selected="$detach_shared_index" \
+    '$2 == session { seen++; if (seen == selected) { print $1; exit } }' \
+    "$snapshot")
+run_tmux detach-client -t "$detached_client_name"
 wait_for 'one control client disconnect' has_control_clients 2
-exec 3>&-
-kill "$control_one_pid" 2>/dev/null || true
-wait "$control_one_pid" 2>/dev/null || true
 mkfifo "$control_reconnect_input"
 exec 6<>"$control_reconnect_input"
 "$tmux_binary" -S "$socket" -f /dev/null -C attach-session -t shared < "$control_reconnect_input" > "$control_reconnect_output" 2>&1 &
 control_reconnect_pid=$!
-control_pids="$control_two_pid $control_three_pid $control_reconnect_pid"
+control_pids="$control_pids $control_reconnect_pid"
 wait_for_with_timeout \
     'reconnected control client' \
     "$CONTROL_RECONNECT_TIMEOUT_SECONDS" \
@@ -270,11 +280,13 @@ grep -q '^%end ' "$control_reconnect_output"
 
 # Server shutdown must terminate every observer promptly and leave no usable socket.
 run_tmux kill-server
-wait_for 'first control client shutdown event' output_contains "$control_two_output" '^%exit'
-wait_for 'second control client shutdown event' output_contains "$control_three_output" '^%exit'
+wait_for 'first original control client shutdown event' output_contains "$control_one_output" '^%exit'
+wait_for 'second original control client shutdown event' output_contains "$control_two_output" '^%exit'
+wait_for 'third original control client shutdown event' output_contains "$control_three_output" '^%exit'
 wait_for 'reconnected control client shutdown event' output_contains "$control_reconnect_output" '^%exit'
-exec 4>&- 5>&- 6>&-
-kill "$control_two_pid" "$control_three_pid" "$control_reconnect_pid" 2>/dev/null || true
+exec 3>&- 4>&- 5>&- 6>&-
+kill "$control_one_pid" "$control_two_pid" "$control_three_pid" "$control_reconnect_pid" 2>/dev/null || true
+wait "$control_one_pid"
 wait "$control_two_pid"
 wait "$control_three_pid"
 wait "$control_reconnect_pid"
