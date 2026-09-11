@@ -65,6 +65,24 @@ cleanup() {
 }
 trap cleanup EXIT HUP INT TERM
 
+tmux_binary_directory=$(dirname "$tmux_binary")
+if [ "$(basename "$tmux_binary")" = tmux ]; then
+    PATH="$tmux_binary_directory:$PATH"
+else
+    tmux_path_directory="$socket_directory/bin"
+    mkdir -p "$tmux_path_directory"
+    ln -s "$tmux_binary" "$tmux_path_directory/tmux"
+    PATH="$tmux_path_directory:$tmux_binary_directory:$PATH"
+fi
+export PATH
+tmux_from_path=$(command -v tmux)
+if [ "$tmux_from_path" != "$tmux_binary" ] \
+    && { [ ! -L "$tmux_from_path" ] || [ "$(readlink "$tmux_from_path")" != "$tmux_binary" ]; }
+then
+    echo "PATH tmux does not resolve to the provided binary: $tmux_binary" >&2
+    exit 2
+fi
+
 mkdir -p "$xdg_config/tmnotify" "$xdg_state" "$xdg_runtime" "$fake_home" "$project"
 chmod 700 "$xdg_config" "$xdg_config/tmnotify" "$xdg_state" "$xdg_runtime" "$fake_home" "$project"
 export XDG_CONFIG_HOME="$xdg_config"

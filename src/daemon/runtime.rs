@@ -32,7 +32,7 @@ use crate::protocol::{
 use crate::render::{RendererSessions, RendererStream, WindowDisplayId};
 
 const SOCKET_MODE: u32 = 0o600;
-const DAEMON_COLD_START_TIMEOUT: Duration = Duration::from_secs(30);
+const DAEMON_COLD_START_TIMEOUT: Duration = Duration::from_secs(10);
 const DAEMON_START_INITIAL_DELAY: Duration = Duration::from_millis(10);
 const DAEMON_START_DELAY_STEP: Duration = Duration::from_millis(5);
 const DAEMON_START_MAX_DELAY_STEPS: u32 = 20;
@@ -1025,7 +1025,7 @@ mod tests {
 
         assert_eq!(response, b"connected");
         assert_eq!(attempts.load(Ordering::SeqCst), 6);
-        assert_eq!(DAEMON_COLD_START_TIMEOUT, Duration::from_secs(30));
+        assert_eq!(DAEMON_COLD_START_TIMEOUT, Duration::from_secs(10));
     }
 
     #[tokio::test]
