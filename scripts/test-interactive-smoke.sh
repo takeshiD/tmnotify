@@ -43,6 +43,8 @@ tmux_version=$("$tmux_binary" -V)
 test_directory=$(mktemp -d "${TMPDIR:-/tmp}/tmnotify-interactive.XXXXXXXX")
 socket_directory=$(mktemp -d /tmp/tmn-smoke.XXXXXXXX)
 socket="$socket_directory/tmux.sock"
+canonical_socket_directory=$(CDPATH='' cd -- "$socket_directory" && pwd -P)
+canonical_socket="$canonical_socket_directory/tmux.sock"
 xdg_config="$test_directory/xdg-config"
 xdg_state="$test_directory/xdg-state"
 xdg_runtime="$socket_directory/xdg-runtime"
@@ -210,7 +212,7 @@ run_tmnotify send --no-source --timeout never --key smoke-race-b 'synthetic-b' >
 race_two=$!
 wait "$race_one"
 wait "$race_two"
-wait_for 'one lazy daemon for the exact socket' daemon_count_is 1 "$socket"
+wait_for 'one lazy daemon for the exact socket' daemon_count_is 1 "$canonical_socket"
 wait_for 'two History rows' history_count_is 2
 record RS-01 'two concurrent send requests [content omitted]'
 
@@ -276,10 +278,10 @@ record RS-04 'move-pane/jump and killed-Source-Pane refusal [content omitted]'
 shared_visible_window=$(run_tmux display-message -p -t shared:source-destination '#{window_id}')
 
 # RS-05: restart on the already-proven topology with History disabled.
-main_daemon=$(daemon_pid "$socket")
+main_daemon=$(daemon_pid "$canonical_socket")
 [ -n "$main_daemon" ]
 kill -TERM "$main_daemon"
-wait_for 'enabled-History daemon shutdown' daemon_count_is 0 "$socket"
+wait_for 'enabled-History daemon shutdown' daemon_count_is 0 "$canonical_socket"
 sleep 0.2
 history_before=$(find "$xdg_state/tmnotify" -type f -exec cksum {} \; | sort)
 printf '[history]\nenabled = false\n' > "$xdg_config/tmnotify/config.toml"
@@ -294,10 +296,10 @@ history_after=$(find "$xdg_state/tmnotify" -type f -exec cksum {} \; | sort)
 [ "$history_before" = "$history_after" ]
 run_tmnotify dismiss --key smoke-disabled-a
 run_tmnotify dismiss --key smoke-disabled-b
-disabled_daemon=$(daemon_pid "$socket")
+disabled_daemon=$(daemon_pid "$canonical_socket")
 [ -n "$disabled_daemon" ]
 kill -TERM "$disabled_daemon"
-wait_for 'disabled-History daemon shutdown' daemon_count_is 0 "$socket"
+wait_for 'disabled-History daemon shutdown' daemon_count_is 0 "$canonical_socket"
 rm "$xdg_config/tmnotify/config.toml"
 run_tmnotify send --no-source --timeout never --key smoke-enabled-again 'synthetic-enabled-again'
 run_tmnotify dismiss --key smoke-enabled-again
@@ -445,7 +447,7 @@ for pid in $client_pids; do
     wait "$pid" 2>/dev/null || true
 done
 client_pids=
-wait_for 'daemon exit after tmux shutdown' daemon_count_is 0 "$socket"
+wait_for 'daemon exit after tmux shutdown' daemon_count_is 0 "$canonical_socket"
 record RS-10 'renderer kill/recreate + daemon restart + read-only doctor + tmux shutdown'
 
 printf '\nAll RS-01 through RS-10 checks passed.\n' >> "$results"
