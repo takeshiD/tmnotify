@@ -1,0 +1,86 @@
+name: Interactive release smoke
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - ".github/workflows/interactive-smoke.yml"
+      - "Cargo.lock"
+      - "Cargo.toml"
+      - "scripts/test-interactive-smoke.sh"
+      - "scripts/test-tmux-capabilities.sh"
+      - "src/**"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: interactive-release-smoke-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  TMUX_COMMIT: d44bfda26d2468b5f474087b56f93eda34c541b6
+
+jobs:
+  macos:
+    name: macOS RS-01..RS-10 (${{ matrix.arch }})
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-14
+            arch: arm64
+          - runner: macos-15-intel
+            arch: x86_64
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - name: Install Rust and tmux build dependencies
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+          brew install automake bison jq libevent ncurses pkg-config
+      - name: Build pinned tmux next-3.8
+        run: |
+          git clone --filter=blob:none https://github.com/tmux/tmux.git "$RUNNER_TEMP/tmux"
+          git -C "$RUNNER_TEMP/tmux" checkout --detach "$TMUX_COMMIT"
+          cd "$RUNNER_TEMP/tmux"
+          sh autogen.sh
+          PKG_CONFIG_PATH="$(brew --prefix libevent)/lib/pkgconfig:$(brew --prefix ncurses)/lib/pkgconfig" \
+            ./configure --prefix="$RUNNER_TEMP/tmux-install" --disable-utf8proc --disable-jemalloc
+          make -j2 install
+      - name: Build release binary
+        run: cargo build --locked --release
+      - name: Run deterministic isolated interactive smoke
+        env:
+          TMNOTIFY_INTERACTIVE_ARTIFACT_DIR: ${{ runner.temp }}/interactive-smoke
+          TMNOTIFY_TMUX_REVISION: ${{ env.TMUX_COMMIT }}
+        run: scripts/test-interactive-smoke.sh "$RUNNER_TEMP/tmux-install/bin/tmux" target/release/tmnotify
+      - name: Run isolated tmux protocol probe
+        env:
+          TMNOTIFY_TMUX_ARTIFACT_DIR: ${{ runner.temp }}/tmux-probe
+          TMNOTIFY_TMUX_REVISION: ${{ env.TMUX_COMMIT }}
+        run: scripts/test-tmux-capabilities.sh "$RUNNER_TEMP/tmux-install/bin/tmux"
+      - name: Run focused bounded-failure evidence
+        run: |
+          cargo test --locked attention_creation_uses_the_modal_new_pane_surface
+          cargo test --locked server_loss_probe_rejects_a_stale_socket_path
+          cargo test --locked history::tests::busy_retries_are_bounded
+          cargo test --locked daemon::runtime::tests::renderer_aware_server_honors_forced_shutdown_during_cleanup
+          cargo test --locked platform::tests::runtime_socket_rejects_non_socket_and_symlink_entries
+      - name: Verify sanitized smoke evidence
+        run: |
+          test -s "$RUNNER_TEMP/interactive-smoke/interactive-smoke.md"
+          test -s "$RUNNER_TEMP/tmux-probe/tmux-capabilities.md"
+      - name: Upload sanitized smoke evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: interactive-smoke-macos-${{ matrix.arch }}
+          path: |
+            ${{ runner.temp }}/interactive-smoke/interactive-smoke.md
+            ${{ runner.temp }}/tmux-probe/tmux-capabilities.md
+          if-no-files-found: ignore
+          retention-days: 14

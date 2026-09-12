@@ -290,6 +290,7 @@ impl<J: JumpExecutor> DaemonService<J> {
                     serde_json::json!({ "deleted": count }),
                 ))
             }
+            ClientCommand::ConfigReload => Err(ServiceError::ConfigReloadBoundary),
         }
     }
 
@@ -426,6 +427,8 @@ pub enum ServiceError {
     HistoryAttentionActive,
     #[error("History Source Pane belongs to a different tmux server")]
     HistoryServerMismatch,
+    #[error("configuration reload must be handled by the daemon application boundary")]
+    ConfigReloadBoundary,
 }
 
 #[cfg(test)]

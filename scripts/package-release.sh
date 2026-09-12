@@ -25,8 +25,8 @@ esac
     exit 2
 }
 
-script_directory=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
-repository_root=$(CDPATH= cd -- "$script_directory/.." && pwd)
+script_directory=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
+repository_root=$(CDPATH='' cd -- "$script_directory/.." && pwd)
 version=$(sed -n 's/^version = "\([^"]*\)"$/\1/p' "$repository_root/Cargo.toml" | head -n 1)
 [ -n "$version" ] || {
     echo "could not read package version" >&2
@@ -35,7 +35,7 @@ version=$(sed -n 's/^version = "\([^"]*\)"$/\1/p' "$repository_root/Cargo.toml" 
 
 archive_root="tmnotify-$version-$target"
 mkdir -p "$output_directory"
-output_directory=$(CDPATH= cd -- "$output_directory" && pwd)
+output_directory=$(CDPATH='' cd -- "$output_directory" && pwd)
 archive="$output_directory/$archive_root.tar.gz"
 epoch=${SOURCE_DATE_EPOCH:-0}
 
@@ -74,7 +74,7 @@ for file in "$repository_root"/docs/adr/*.md; do
 done
 
 raw_archive="$stage/package.tar"
-(CDPATH= cd -- "$stage" && "$tar_command" \
+(CDPATH='' cd -- "$stage" && "$tar_command" \
     --sort=name \
     --format=ustar \
     --mtime="@$epoch" \

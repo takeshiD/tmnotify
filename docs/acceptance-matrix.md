@@ -81,12 +81,13 @@ product policy rather than tmux protocol behavior, so their deterministic
 checks run in the same required Linux job as TOAST-STACKING, TOAST-ANIMATION,
 and ATTENTION-QUEUE.
 
-## Temporary platform exception
+## Platform interactive evidence
 
-Until a stable tmux 3.8 runner is available on macOS, pull-request CI runs all
-unit/module tests and a release build there, while Linux builds the pinned
-upstream floating-pane commit and the scheduled job checks current master.
-Every release still requires the macOS interactive checks RS-02, RS-04, RS-06,
-RS-07, and RS-10 from docs/release.md. Record the tmux version, host
-architecture, and result in the release notes. This is the temporary exception
-allowed by design section 21.3; it does not waive the release gate.
+`scripts/test-interactive-smoke.sh` exercises RS-01 through RS-10 through an
+isolated tmux server, disposable provider/XDG paths, and real PTYs. The manual
+`Interactive release smoke` workflow runs it on both supported macOS
+architectures against the pinned next-3.8 revision and uploads a sanitized
+result matrix. Linux release evidence is produced by the same command. The
+lower-level `scripts/test-tmux-capabilities.sh` and focused fault tests remain
+required alongside it for deterministic control reconnect, SQLite contention,
+stale socket, and forced-shutdown evidence.

@@ -16,7 +16,11 @@ use crate::notification::{Notification, Presentation};
 use crate::protocol::RendererContent;
 
 pub const COMPACT_MIN_WIDTH: u16 = 32;
-pub const COMPACT_MIN_HEIGHT: u16 = 7;
+// tmux reports the renderer's content area after consuming the floating pane's
+// two border rows. A user-visible 7-row Attention Window therefore reaches the
+// renderer as 5 rows, which is still enough for the compact title/body/error/
+// footer layout.
+pub const COMPACT_MIN_HEIGHT: u16 = 5;
 pub const WIDE_MIN_WIDTH: u16 = 60;
 pub const WIDE_MIN_HEIGHT: u16 = 10;
 
@@ -332,6 +336,15 @@ mod tests {
         assert!(text.contains("Codex needs input"));
         assert!(!text.contains("/work/project"));
         assert!(text.contains("[Esc/q] dismiss"));
+    }
+
+    #[test]
+    fn bordered_popup_content_height_keeps_compact_attention_readable() {
+        let text = draw(60, 5, &state()).join("\n");
+        assert!(text.contains("Codex needs input"));
+        assert!(text.contains("Approve the requested operation"));
+        assert!(text.contains("[Enter] jump"));
+        assert!(!text.contains("terminal too small"));
     }
 
     #[test]

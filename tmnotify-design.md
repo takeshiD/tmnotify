@@ -617,6 +617,21 @@ validation reports an error. Hook preset changes require `hook sync`.
 
 Unknown config fields are errors. Values have bounded ranges.
 
+`tmnotify config show` loads the default XDG user path without requiring tmux
+or a daemon and writes the complete effective configuration to stdout as
+canonical, deterministic TOML. It includes built-in defaults merged with the
+user file and defined environment overrides; comments and source ordering are
+not preserved.
+
+`tmnotify config reload` uses the ordinary tmux target-resolution rules and
+sends a bounded, versioned request to the already-running daemon selected by
+that target. It never lazily starts a daemon. The daemon re-reads
+`config.toml` immediately, atomically applies a valid changed snapshot, and
+acknowledges `changed` or `unchanged`. Invalid, insecure, or symlink-unsafe
+input fails the direct command and retains the daemon's last-known-good
+snapshot. Reloading hook preset settings never modifies a Hook Installation;
+that remains exclusive to an explicit `hook sync`.
+
 ```toml
 [daemon]
 idle_timeout = "never"
@@ -677,6 +692,8 @@ tmnotify [-L NAME|-S PATH] dismiss (--id ID|--key KEY)
 tmnotify [-L NAME|-S PATH] jump --key KEY
 tmnotify [-L NAME|-S PATH] history [--plain|--json|--all|--all-servers]
 tmnotify history clear <FILTER> [--yes]
+tmnotify config show
+tmnotify [-L NAME|-S PATH] config reload [--json]
 tmnotify hook install <claude|codex> [SCOPE]
 tmnotify hook remove <claude|codex> [SCOPE]
 tmnotify hook sync [claude|codex]
@@ -691,6 +708,10 @@ an explicit target and never guess.
 `send -` and `update ... -` read bounded multiline stdin. Successful commands
 are silent by default; `--json` emits structured acknowledgement. Errors and
 warnings use stderr.
+
+`config show` is a stdout result and always emits TOML. `config reload` is the
+exceptional mutation whose plain stdout acknowledgement is `changed` or
+`unchanged`; `--json` emits an object containing `accepted` and `changed`.
 
 Send defaults are Info, Normal, Toast, and automatic Source capture. Options:
 

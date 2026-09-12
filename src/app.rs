@@ -10,12 +10,14 @@ use serde_json::Value;
 use thiserror::Error;
 
 use crate::cli::{
-    ClearArgs, Cli, Command, DoctorArgs, HistoryAction, HistoryArgs, HookAction, HookArgs,
-    HookEventArgs, HookMutationArgs, HookScopeArg, HookSelectionArgs, ProviderArg, RendererArgs,
-    Selector, TmuxTarget,
+    ClearArgs, Cli, Command, ConfigAction, DoctorArgs, HistoryAction, HistoryArgs, HookAction,
+    HookArgs, HookEventArgs, HookMutationArgs, HookScopeArg, HookSelectionArgs, ProviderArg,
+    RendererArgs, Selector, TmuxTarget,
 };
-use crate::config::{Config, ConfigOverrides, FeatureMode, HooksConfig, TimeoutValue, load};
-use crate::daemon::application::HistoryActionClient;
+use crate::config::{
+    Config, ConfigOverrides, FeatureMode, HooksConfig, TimeoutValue, load, to_stable_toml,
+};
+use crate::daemon::application::{HistoryActionClient, request_config_reload};
 use crate::daemon::runtime::{RuntimeError, ServerIdentity, submit_lazy};
 use crate::doctor::{DoctorOutputError, HookObservation, SystemProbe};
 use crate::history::{ClearFilter, History, HistoryError, HistoryQuery, write_ndjson, write_plain};
@@ -183,6 +185,16 @@ pub async fn run(cli: Cli) -> Result<(), RuntimeAppError> {
 
     let environment = Environment::current();
     let paths = PlatformPaths::resolve(&environment)?;
+    if matches!(
+        &cli.command,
+        Command::Config(crate::cli::ConfigArgs {
+            action: ConfigAction::Show
+        })
+    ) {
+        let config = load(&paths.config_file, &environment, ConfigOverrides::default())?;
+        write!(io::stdout().lock(), "{}", to_stable_toml(&config)?)?;
+        return Ok(());
+    }
     let tmux_environment = environment.get("TMUX").and_then(|value| value.to_str());
     let inside_tmux = tmux_environment.is_some();
     let target = cli.tmux_target(tmux_environment)?;
@@ -190,6 +202,24 @@ pub async fn run(cli: Cli) -> Result<(), RuntimeAppError> {
     let selected = server
         .map(|server| SelectedServer::new(server, &paths))
         .transpose()?;
+    if let Command::Config(crate::cli::ConfigArgs {
+        action: ConfigAction::Reload(arguments),
+    }) = &cli.command
+    {
+        let selected = require_server(selected)?;
+        let result = request_config_reload(&selected.daemon_socket).await?;
+        if arguments.json {
+            serde_json::to_writer(io::stdout().lock(), &result)?;
+            println!();
+        } else {
+            let changed = result
+                .get("changed")
+                .and_then(Value::as_bool)
+                .ok_or_else(|| RuntimeAppError::Remote("invalid reload acknowledgement".into()))?;
+            println!("{}", if changed { "changed" } else { "unchanged" });
+        }
+        return Ok(());
+    }
     let config = load(&paths.config_file, &environment, ConfigOverrides::default())?;
 
     match cli.command {
@@ -267,6 +297,7 @@ pub async fn run(cli: Cli) -> Result<(), RuntimeAppError> {
                 }
             }
         }
+        Command::Config(_) => unreachable!("configuration commands returned before dispatch"),
         Command::Hook(arguments) => {
             let manager = production_hook_manager(&environment)?;
             run_hook_command(&manager, &config.hooks, arguments, io::stdout().lock())?;
@@ -774,6 +805,8 @@ pub enum RuntimeAppError {
     App(#[from] AppError),
     #[error(transparent)]
     HistoryAction(#[from] crate::daemon::application::HistoryActionError),
+    #[error(transparent)]
+    ConfigReload(#[from] crate::daemon::application::ConfigReloadError),
     #[error(transparent)]
     Cli(#[from] crate::cli::CliError),
     #[error(transparent)]

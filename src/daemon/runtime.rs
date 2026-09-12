@@ -32,7 +32,7 @@ use crate::protocol::{
 use crate::render::{RendererSessions, RendererStream, WindowDisplayId};
 
 const SOCKET_MODE: u32 = 0o600;
-const DAEMON_START_ATTEMPTS: u32 = 40;
+const DAEMON_COLD_START_TIMEOUT: Duration = Duration::from_secs(10);
 const DAEMON_START_INITIAL_DELAY: Duration = Duration::from_millis(10);
 const DAEMON_START_DELAY_STEP: Duration = Duration::from_millis(5);
 const DAEMON_START_MAX_DELAY_STEPS: u32 = 20;
@@ -830,8 +830,21 @@ pub async fn submit_lazy(
         Err(error) => return Err(error),
     }
     spawn_hidden_daemon(tmux_socket)?;
-    for attempt in 0..DAEMON_START_ATTEMPTS {
-        match exchange(socket, request).await {
+    retry_daemon_start(DAEMON_COLD_START_TIMEOUT, || exchange(socket, request)).await
+}
+
+async fn retry_daemon_start<F, Fut>(
+    startup_timeout: Duration,
+    mut try_exchange: F,
+) -> Result<Vec<u8>, RuntimeError>
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = Result<Vec<u8>, RuntimeError>>,
+{
+    let deadline = Instant::now() + startup_timeout;
+    let mut attempt = 0_u32;
+    loop {
+        match try_exchange().await {
             Ok(response) => return Ok(response),
             Err(RuntimeError::Connect(error))
                 if matches!(
@@ -839,16 +852,17 @@ pub async fn submit_lazy(
                     io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused
                 ) =>
             {
-                sleep(
-                    DAEMON_START_INITIAL_DELAY
-                        + DAEMON_START_DELAY_STEP * attempt.min(DAEMON_START_MAX_DELAY_STEPS),
-                )
-                .await;
+                let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+                    return Err(RuntimeError::StartupTimedOut);
+                };
+                let delay = DAEMON_START_INITIAL_DELAY
+                    + DAEMON_START_DELAY_STEP * attempt.min(DAEMON_START_MAX_DELAY_STEPS);
+                sleep(delay.min(remaining)).await;
+                attempt = attempt.saturating_add(1);
             }
             Err(error) => return Err(error),
         }
     }
-    Err(RuntimeError::StartupTimedOut)
 }
 
 /// Submits to an already-running daemon without starting one. History uses
@@ -986,6 +1000,50 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o700)).unwrap();
         temp
+    }
+
+    fn daemon_not_ready() -> RuntimeError {
+        RuntimeError::Connect(io::Error::new(
+            io::ErrorKind::NotFound,
+            "injected delayed daemon startup",
+        ))
+    }
+
+    #[tokio::test]
+    async fn startup_retry_survives_delayed_connect_within_its_local_bound() {
+        let attempts = AtomicUsize::new(0);
+        let response = retry_daemon_start(Duration::from_secs(1), || {
+            let attempt = attempts.fetch_add(1, Ordering::SeqCst);
+            std::future::ready(if attempt < 5 {
+                Err(daemon_not_ready())
+            } else {
+                Ok(b"connected".to_vec())
+            })
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(response, b"connected");
+        assert_eq!(attempts.load(Ordering::SeqCst), 6);
+        assert_eq!(DAEMON_COLD_START_TIMEOUT, Duration::from_secs(10));
+    }
+
+    #[tokio::test]
+    async fn startup_retry_timeout_is_bounded_without_changing_response_or_shutdown_limits() {
+        let started = Instant::now();
+        let error = retry_daemon_start(Duration::from_millis(25), || {
+            std::future::ready(Err(daemon_not_ready()))
+        })
+        .await
+        .unwrap_err();
+
+        assert!(matches!(error, RuntimeError::StartupTimedOut));
+        assert!(started.elapsed() < Duration::from_millis(250));
+        assert_eq!(RESPONSE_TIMEOUT, Duration::from_secs(2));
+        assert_eq!(
+            RuntimeLimits::default().shutdown_timeout,
+            Duration::from_secs(2)
+        );
     }
 
     #[test]
