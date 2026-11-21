@@ -52,8 +52,12 @@ impl Topology {
             .filter(|pane| pane.window_id == *window_id && !pane.is_floating)
         {
             found = true;
-            width = width.max(pane.left.saturating_add(pane.width));
-            height = height.max(pane.top.saturating_add(pane.height));
+            // Floating panes are excluded, but an animating Toast can sit
+            // outside the window, so keep pane positions signed.
+            let left = u16::try_from(pane.left).unwrap_or(0);
+            let top = u16::try_from(pane.top).unwrap_or(0);
+            width = width.max(left.saturating_add(pane.width));
+            height = height.max(top.saturating_add(pane.height));
         }
         found.then_some(WindowSize { width, height })
     }
@@ -91,8 +95,9 @@ pub struct Pane {
     pub session_id: String,
     pub window_id: WindowId,
     pub is_floating: bool,
-    pub left: u16,
-    pub top: u16,
+    /// Signed because an animating floating Toast may sit outside the window.
+    pub left: i32,
+    pub top: i32,
     pub width: u16,
     pub height: u16,
 }
@@ -203,6 +208,24 @@ mod tests {
             topology.likely_client_for_window(&WindowId("@1".into())),
             Some("client-b")
         );
+        assert_eq!(
+            topology.window_size(&WindowId("@1".into())),
+            Some(WindowSize {
+                width: 80,
+                height: 24
+            })
+        );
+    }
+
+    #[test]
+    fn accepts_offscreen_floating_panes_during_enter_animation() {
+        let topology = Topology::from_format_output(
+            "client-a\t0\t$0\t@1\t100\n",
+            "%3\t$0\t@1\t0\t0\t0\t80\t24\n%4\t$0\t@1\t1\t-42\t-3\t42\t3\n",
+        )
+        .unwrap();
+        let pane = &topology.panes[&PaneId("%4".into())];
+        assert_eq!((pane.left, pane.top), (-42, -3));
         assert_eq!(
             topology.window_size(&WindowId("@1".into())),
             Some(WindowSize {

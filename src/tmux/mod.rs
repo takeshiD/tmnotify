@@ -63,8 +63,9 @@ pub enum DisplayKind {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Geometry {
-    pub x: u16,
-    pub y: u16,
+    /// Signed so animation frames can place a floating pane outside the window.
+    pub x: i32,
+    pub y: i32,
     pub width: u16,
     pub height: u16,
     pub z_index: u16,

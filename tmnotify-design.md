@@ -373,9 +373,13 @@ enter_easing = "ease-out"
 exit_easing = "ease-in"
 ```
 
-Positions are interpolated in cells. Quantized duplicates are not sent. Updates
-for all windows in a tick are batched. Reflow animation and color interpolation
-are outside the MVP.
+Positions are interpolated in cells. A Toast enters from the window edge that
+owns its placement and exits back to that same edge: side placements move
+horizontally, and center placements move vertically. Left and top edge
+positions are outside the viewport, so the Toast appears to slide in from the
+edge rather than emerging from the middle of the window. Quantized duplicates
+are not sent. Updates for all windows in a tick are batched. Reflow animation
+and color interpolation are outside the MVP.
 
 Animation is disabled by `enabled = false`, zero duration, or `TERM=dumb`.
 Follow recreation does not replay enter animation.
