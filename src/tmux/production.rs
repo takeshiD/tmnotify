@@ -238,20 +238,32 @@ impl ProductionBackend {
         };
         let pane_id = PaneId(pane);
         if desired.kind == DisplayKind::Toast {
-            let commands = vec![break_floating_command(&pane_id, window, desired.geometry)];
-            let result = match self.command(&commands) {
-                Ok(result) => result,
-                Err(error) => {
+            let origin = floating_origin(desired.geometry);
+            let mut moves = Vec::new();
+            append_relative_moves(&mut moves, &pane_id, origin, desired.geometry);
+            let mut batches = vec![vec![break_floating_command(&pane_id, window, origin)]];
+            if !moves.is_empty() {
+                batches.push(moves);
+            }
+            for commands in batches {
+                let result = match self.command(&commands) {
+                    Ok(result) => result,
+                    Err(error) => {
+                        let _ = self.command(&[vec![
+                            "kill-pane".into(),
+                            "-t".into(),
+                            pane_id.0.clone(),
+                        ]]);
+                        self.terminate_renderer(&display_id, RendererTermination::RenderFailed);
+                        return Err(error);
+                    }
+                };
+                if let Err(error) = require_success(&result) {
                     let _ =
                         self.command(&[vec!["kill-pane".into(), "-t".into(), pane_id.0.clone()]]);
                     self.terminate_renderer(&display_id, RendererTermination::RenderFailed);
                     return Err(error);
                 }
-            };
-            if let Err(error) = require_success(&result) {
-                let _ = self.command(&[vec!["kill-pane".into(), "-t".into(), pane_id.0.clone()]]);
-                self.terminate_renderer(&display_id, RendererTermination::RenderFailed);
-                return Err(error);
             }
         }
         self.displays.insert(
@@ -866,6 +878,14 @@ fn tmux_literal(value: &str) -> Result<String, Error> {
     Ok(encoded)
 }
 
+fn floating_origin(geometry: Geometry) -> Geometry {
+    Geometry {
+        x: geometry.x.max(0),
+        y: geometry.y.max(0),
+        ..geometry
+    }
+}
+
 fn break_floating_command(pane: &PaneId, window: &WindowId, geometry: Geometry) -> Vec<String> {
     vec![
         "break-pane".into(),
@@ -951,7 +971,7 @@ mod tests {
         crate::protocol::RendererContent::from(&Notification::from_draft(draft, Utc::now()))
     }
 
-    fn geometry(x: u16, y: u16, width: u16, height: u16, z_index: u16) -> Geometry {
+    fn geometry(x: i32, y: i32, width: u16, height: u16, z_index: u16) -> Geometry {
         Geometry {
             x,
             y,
@@ -1121,6 +1141,27 @@ mod tests {
     }
 
     #[test]
+    fn floating_create_clamps_the_break_origin_and_moves_offscreen() {
+        let requested = geometry(-42, -3, 42, 5, 0);
+        let origin = floating_origin(requested);
+        assert_eq!((origin.x, origin.y), (0, 0));
+        let mut moves = Vec::new();
+        append_relative_moves(&mut moves, &PaneId("%4".into()), origin, requested);
+        assert_eq!(
+            moves,
+            vec![
+                strings(&["move-pane", "-t", "%4", "-L", "42"]),
+                strings(&["move-pane", "-t", "%4", "-U", "3"]),
+            ]
+        );
+        assert_eq!(
+            origin,
+            geometry(0, 0, 42, 5, 0),
+            "origin keeps the requested size"
+        );
+    }
+
+    #[test]
     fn geometry_updates_are_relative_and_batchable() {
         let mut commands = Vec::new();
         append_relative_moves(
@@ -1134,6 +1175,24 @@ mod tests {
             vec![
                 strings(&["move-pane", "-t", "%9", "-L", "3"]),
                 strings(&["move-pane", "-t", "%9", "-D", "3"]),
+            ]
+        );
+    }
+
+    #[test]
+    fn geometry_updates_cross_the_window_edge_with_signed_coordinates() {
+        let mut commands = Vec::new();
+        append_relative_moves(
+            &mut commands,
+            &PaneId("%9".into()),
+            geometry(0, 0, 40, 3, 0),
+            geometry(-42, -4, 40, 3, 0),
+        );
+        assert_eq!(
+            commands,
+            vec![
+                strings(&["move-pane", "-t", "%9", "-L", "42"]),
+                strings(&["move-pane", "-t", "%9", "-U", "4"]),
             ]
         );
     }

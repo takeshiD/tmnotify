@@ -575,8 +575,8 @@ impl WindowReconciler {
             display_id: display_id(id, window),
             kind: DisplayKind::Attention,
             geometry: Geometry {
-                x: size.width.saturating_sub(width) / 2,
-                y: size.height.saturating_sub(height) / 2,
+                x: i32::from(size.width.saturating_sub(width) / 2),
+                y: i32::from(size.height.saturating_sub(height) / 2),
                 width,
                 height,
                 z_index: 100,
@@ -863,8 +863,8 @@ fn toast_geometry(
         }
     };
     Geometry {
-        x,
-        y,
+        x: i32::from(x),
+        y: i32::from(y),
         width,
         height,
         z_index: u16::try_from(z_index).unwrap_or(u16::MAX),
@@ -1241,8 +1241,8 @@ mod tests {
             2,
             "all windows share one frame batch"
         );
-        assert_eq!(entered.windows[&WindowId("@1".into())][0].geometry.x, 16);
-        assert_eq!(entered.windows[&WindowId("@2".into())][0].geometry.x, 0);
+        assert_eq!(entered.windows[&WindowId("@1".into())][0].geometry.x, 100);
+        assert_eq!(entered.windows[&WindowId("@2".into())][0].geometry.x, 80);
 
         reconciler
             .tick(&mut backend, &mut scheduler, mono(10), wall(10))
@@ -1253,8 +1253,8 @@ mod tests {
             .unwrap();
         assert_eq!(backend.plans.len(), 2);
         let midway = backend.plans.last().unwrap();
-        assert_eq!(midway.windows[&WindowId("@1".into())][0].geometry.x, 48);
-        assert_eq!(midway.windows[&WindowId("@2".into())][0].geometry.x, 29);
+        assert_eq!(midway.windows[&WindowId("@1".into())][0].geometry.x, 69);
+        assert_eq!(midway.windows[&WindowId("@2".into())][0].geometry.x, 49);
 
         reconciler
             .tick(&mut backend, &mut scheduler, mono(100), wall(100))
@@ -1286,7 +1286,7 @@ mod tests {
             backend.plans.last().unwrap().windows[&WindowId("@1".into())][0]
                 .geometry
                 .x,
-            16
+            100
         );
         reconciler
             .tick(&mut backend, &mut scheduler, mono(301), wall(301))
@@ -1508,8 +1508,45 @@ mod tests {
             backend.plans.last().unwrap().windows[&WindowId("@1".into())][0]
                 .geometry
                 .x,
-            0,
+            80,
             "control loss pauses rather than completes enter animation"
         );
+    }
+
+    #[test]
+    fn left_anchored_toast_enter_frames_move_inward_from_the_window_edge() {
+        let mut backend = FakeBackend {
+            topology: topology(&[("a", false, "@1")], &[("@1", 80, 24)]),
+            ..FakeBackend::default()
+        };
+        let mut scheduler = scheduler();
+        scheduler.submit(toast("left"), mono(0), wall(0)).unwrap();
+        let policy = WindowDisplayPolicy {
+            placement: Placement::TopLeft,
+            animation: ToastAnimationPolicy {
+                fps: 20,
+                enter_duration: Duration::from_millis(100),
+                ..ToastAnimationPolicy::default()
+            },
+            ..WindowDisplayPolicy::default()
+        };
+        let mut reconciler = WindowReconciler::new(policy, mono(0));
+        let mut xs = Vec::new();
+        for at in [0_u64, 50, 100] {
+            reconciler
+                .tick(
+                    &mut backend,
+                    &mut scheduler,
+                    mono(at),
+                    wall(i64::try_from(at).unwrap()),
+                )
+                .unwrap();
+            xs.push(
+                backend.plans.last().unwrap().windows[&WindowId("@1".into())][0]
+                    .geometry
+                    .x,
+            );
+        }
+        assert_eq!(xs, vec![-42, -11, 0]);
     }
 }

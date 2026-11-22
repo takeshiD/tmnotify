@@ -27,8 +27,9 @@ pub struct Viewport {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Rect {
-    pub x: u16,
-    pub y: u16,
+    /// Signed because motion may start or end outside the visible viewport.
+    pub x: i32,
+    pub y: i32,
     pub width: u16,
     pub height: u16,
 }
@@ -204,8 +205,8 @@ pub fn layout_window<'a>(
             };
             PlacedSlot {
                 rect: Rect {
-                    x,
-                    y,
+                    x: i32::from(x),
+                    y: i32::from(y),
                     width: slot_width,
                     height: slot_height,
                 },
@@ -667,31 +668,25 @@ pub fn plan_frames<'a>(tracks: &[MotionTrack<'a>], fps: u32, enabled: bool) -> V
     batches
 }
 
+/// Returns the position just outside the viewport on the edge that owns the
+/// Toast's placement. Enter motion starts here and moves to the slot; exit
+/// motion returns here.
+///
+/// Side placements move horizontally and center placements move vertically, so
+/// a Toast always emerges from the window edge it is anchored to. Left and top
+/// coordinates are negative; tmux floating panes may be moved outside the
+/// viewport even though their initial creation position must stay on-screen.
 #[must_use]
 pub fn offscreen_rect(target: Rect, viewport: Viewport, placement: Placement) -> Rect {
+    let width = i32::from(target.width);
+    let height = i32::from(target.height);
     let (x, y) = match placement {
-        Placement::TopLeft | Placement::BottomLeft => (
-            i32::from(target.x.saturating_add(target.width)),
-            i32::from(target.y),
-        ),
-        Placement::TopRight | Placement::BottomRight => (
-            i32::from(target.x.saturating_sub(target.width)),
-            i32::from(target.y),
-        ),
-        Placement::TopCenter => (
-            i32::from(target.x),
-            i32::from(target.y.saturating_add(target.height)),
-        ),
-        Placement::BottomCenter => (
-            i32::from(target.x),
-            i32::from(target.y.saturating_sub(target.height)),
-        ),
+        Placement::TopLeft | Placement::BottomLeft => (-width, target.y),
+        Placement::TopRight | Placement::BottomRight => (i32::from(viewport.width), target.y),
+        Placement::TopCenter => (target.x, -height),
+        Placement::BottomCenter => (target.x, i32::from(viewport.height)),
     };
-    Rect {
-        x: clamp_cell(x).min(viewport.width.saturating_sub(target.width)),
-        y: clamp_cell(y).min(viewport.height.saturating_sub(target.height)),
-        ..target
-    }
+    Rect { x, y, ..target }
 }
 
 fn ease(progress: f64, easing: Easing) -> f64 {
@@ -711,13 +706,9 @@ fn interpolate(from: Rect, to: Rect, progress: f64) -> Rect {
     }
 }
 
-fn lerp(from: u16, to: u16, progress: f64) -> u16 {
+fn lerp(from: i32, to: i32, progress: f64) -> i32 {
     let value = f64::from(from) + (f64::from(to) - f64::from(from)) * progress;
-    clamp_cell(value.round() as i32)
-}
-
-fn clamp_cell(value: i32) -> u16 {
-    u16::try_from(value.max(0)).unwrap_or(u16::MAX)
+    value.round() as i32
 }
 
 #[cfg(test)]
@@ -772,6 +763,90 @@ mod tests {
             } else {
                 assert_eq!((layout.slots[0].rect.y, layout.slots[1].rect.y), (17, 13));
             }
+        }
+    }
+
+    #[test]
+    fn motion_enters_from_and_exits_to_the_anchored_window_edge() {
+        let viewport = Viewport {
+            width: 100,
+            height: 20,
+        };
+        let cases = [
+            (
+                Placement::TopLeft,
+                Rect {
+                    x: 0,
+                    y: 0,
+                    width: 42,
+                    height: 3,
+                },
+                (-42, 0),
+            ),
+            (
+                Placement::BottomLeft,
+                Rect {
+                    x: 0,
+                    y: 17,
+                    width: 42,
+                    height: 3,
+                },
+                (-42, 17),
+            ),
+            (
+                Placement::TopCenter,
+                Rect {
+                    x: 29,
+                    y: 0,
+                    width: 42,
+                    height: 3,
+                },
+                (29, -3),
+            ),
+            (
+                Placement::BottomCenter,
+                Rect {
+                    x: 29,
+                    y: 17,
+                    width: 42,
+                    height: 3,
+                },
+                (29, 20),
+            ),
+            (
+                Placement::TopRight,
+                Rect {
+                    x: 58,
+                    y: 0,
+                    width: 42,
+                    height: 3,
+                },
+                (100, 0),
+            ),
+            (
+                Placement::BottomRight,
+                Rect {
+                    x: 58,
+                    y: 17,
+                    width: 42,
+                    height: 3,
+                },
+                (100, 17),
+            ),
+        ];
+        for (placement, target, expected) in cases {
+            let outside = offscreen_rect(target, viewport, placement);
+            assert_eq!((outside.x, outside.y), expected, "{placement:?}");
+            assert_eq!(
+                (outside.width, outside.height),
+                (target.width, target.height),
+                "{placement:?}"
+            );
+            assert_eq!(
+                offscreen_rect(outside, viewport, placement),
+                outside,
+                "{placement:?} exit returns to the same edge"
+            );
         }
     }
 
