@@ -282,6 +282,13 @@ vhs validate demo/tmnotify.tape
 vhs demo/tmnotify.tape
 ```
 
+The six per-placement animation demos under
+[`demo/placements/`](demo/placements/) are rendered with asciinema and agg:
+
+```console
+demo/record-placement-gifs.sh
+```
+
 See the [release process](docs/release.md), [product design](tmnotify-design.md),
 [domain language](CONTEXT.md), and [accepted ADRs](docs/adr/) for the complete
 contracts.
